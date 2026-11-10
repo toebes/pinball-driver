@@ -1,0 +1,53 @@
+# Build directories and CMake output
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Compiled firmware and intermediate output
+*.o
+*.obj
+*.a
+*.elf
+*.axf
+*.hex
+*.bin
+*.map
+*.d
+
+# ESP32 / PlatformIO local and generated output
+.pio/
+sdkconfig.old
+sdkconfig
+managed_components/
+dependencies.lock.tmp
+
+# Machine-specific development settings
+CMakeUserPresets.json
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+*.code-workspace
+.cache/
+*.log
+
+# Python utilities
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
