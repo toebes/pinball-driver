@@ -17,9 +17,9 @@ Outputs: `build/py32/py32_smoke.elf`, `.hex`, `.bin`, and `.map`.
 
 The build references the external official SDK, including its GCC startup assembly, system initialization source, CMSIS headers, and `py32f002bx5.ld`. It does not copy SDK files into Git. The SDK template selects `PY32F002Bx5`, Cortex-M0+, 24 KB flash, and 3 KB RAM. Confirm these against the fitted device before programming.
 
-Local validation used Arm GNU 15.3.1 and CMake 3.30.1. The initial link succeeds with vendor-script RWX segment and newlib unimplemented file-I/O warnings. The smoke program does not use file I/O. Review the linker layout before treating this as a production build.
+Local validation used Arm GNU 15.3.1 and CMake 3.30.1. The link can report vendor-script RWX segment and unused newlib file I/O warnings. Review the linker layout before treating this as a production build.
 
-For the verified ring bench build, use `-B build/py32-ring-bench` and add `"-DPINBALL_ENABLE_HALL_ADC=OFF"` when configuring. Build that directory and use its ELF for all four nodes.
+For the verified ring bench build, use `-B build/py32-ring-bench` and add `"-DPINBALL_ENABLE_HALL_ADC=OFF"` when configuring. Build that directory and use the bootloader and application ELFs for initial SWD installation on each node.
 
 ## Verified ST-LINK bring-up
 
@@ -31,18 +31,30 @@ The original 24 KB flash contents were saved locally in `.local/backups/before-s
 
 To reproduce the local tool setup, extract `Packs/GCC/openocd-0.12.0.zip` from the official SDK into `.local/puya/`.
 
-In VS Code, open the PinballDriver folder, select **PY32 smoke - ST-LINK** in Run and Debug, and press F5. This local launch configuration programs the smoke ELF and stops at main. Add `heartbeat_count` to Watch and continue execution; pause to inspect its value. The VS Code debug session was verified during bring-up.
+For nodes with the resident bootloader installed, attach the debugger and load symbols from py32_app.elf. Inspect heartbeat_count to confirm that the application is running.
 
-## Semihosting printf
+## Resident bootloader bench build
 
-The smoke firmware now links with `rdimon.specs`, initializes monitor handles, and uses a small line buffer for stdout. OpenOCD enables semihosting when the target halts. The board successfully printed:
+The PY32 targets use size optimization and link without semihosting. The ring
+bench build produces `py32_bootloader.elf` and `py32_app.elf`.
 
-```text
-PinballDriver: PY32 semihosting ready. Core clock: 24000000 Hz
-```
+| Region | Start | Size |
+|---|---|---:|
+| Resident bootloader | 0x08000000 | 4 KiB |
+| Application | 0x08001000 | 8 KiB |
+| Staging | 0x08003000 | 8 KiB |
+| Update metadata | 0x08005000 | 4 KiB |
 
-In VS Code, start debugging with F5, then Continue past the breakpoint at main. Output appears in the **Terminal** tab named **gdb-server**. Use a newline in printf messages, or call `fflush(stdout)` to flush a partial line.
+With the ST-LINK attached, program and verify both ELFs at their linked
+addresses, then reset and run. The bootloader checks the application's initial
+stack and reset vector before handing off. SWD confirmed that the relocated
+application runs with VTOR at `0x08001000` and an advancing heartbeat.
 
-The firmware checks whether halting debug is enabled before using semihosting. Semihosting output requires OpenOCD to be attached and configured. Printing also interrupts normal processor execution, so avoid it in timing-critical paths.
+Use the standalone `py32_smoke.elf` only on a board where you intend to
+replace the resident bootloader. It is linked at the flash base. For an
+installed bootloader, load application symbols from `py32_app.elf`.
 
-Only one OpenOCD session can use the ST-LINK at a time. Stop the existing debug session before starting another programming or connection check.
+Firmware commands 10 through 12 stage and verify an application image, then request activation by the resident bootloader. The default application version is 0.2. Set -DPINBALL_VERSION_MINOR=0 in a separate bench build to create an older test target.
+
+Application diagnostics can travel as DEBUG packets to the ESP32 USB serial
+log. Only one OpenOCD session can use the ST-LINK at a time.

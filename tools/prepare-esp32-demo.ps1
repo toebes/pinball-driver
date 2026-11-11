@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string] $DemoArduinoRoot
+    [string] $DemoArduinoRoot,
+    [string] $Py32Build
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,8 +37,47 @@ if (!$source.Contains('  led_control_screen_poll();')) {
         "  led_control_screen_poll();`n  lv_timer_handler();")
 }
 
+# Keep touch input active while suppressing the vendor demo's coordinate trace.
+$source = $source -replace '(?m)^[ \t]*Serial\.(?:print\(\s*"Data [xy] "\s*\)|println\(\s*data->point\.[xy]\s*\));\r?\n', ''
+
 Copy-Item -LiteralPath $lvConfig -Destination (Join-Path $libraries 'lv_conf.h') -Force
 Copy-Item -LiteralPath (Join-Path $project 'firmware/esp32/src/ring_ping.cpp') -Destination $sketch -Force
 Copy-Item -LiteralPath (Join-Path $project 'shared/protocol/ring_frame.h') -Destination $sketch -Force
+Copy-Item -LiteralPath (Join-Path $project 'shared/protocol/firmware_update.h') -Destination $sketch -Force
+
+$imageHeader = Join-Path $sketch 'py32_update_image.h'
+if ($Py32Build) {
+    $build = (Resolve-Path -LiteralPath $Py32Build).Path
+    $image = [IO.File]::ReadAllBytes((Join-Path $build 'py32_app.bin'))
+    if ($image.Length -lt 8 -or $image.Length -gt 8192) {
+        throw 'PY32 application image must fit in the 8 KiB staging slot.'
+    }
+    $cache = Get-Content -LiteralPath (Join-Path $build 'CMakeCache.txt') -Raw
+    if ($cache -notmatch '(?m)^PINBALL_VERSION_MAJOR:STRING=(\d+)\r?$') {
+        throw 'Firmware major version missing from CMake cache.'
+    }
+    $major = [byte]$Matches[1]
+    if ($cache -notmatch '(?m)^PINBALL_VERSION_MINOR:STRING=(\d+)\r?$') {
+        throw 'Firmware minor version missing from CMake cache.'
+    }
+    $minor = [byte]$Matches[1]
+
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add('#pragma once')
+    $lines.Add('#define PINBALL_HAS_UPDATE_IMAGE 1')
+    $lines.Add("static constexpr uint8_t image_major = $major;")
+    $lines.Add("static constexpr uint8_t image_minor = $minor;")
+    $lines.Add('static constexpr uint8_t py32_update_image[] = {')
+    for ($start = 0; $start -lt $image.Length; $start += 16) {
+        $end = [Math]::Min($start + 15, $image.Length - 1)
+        $bytes = $image[$start..$end] | ForEach-Object { '0x{0:X2}' -f $_ }
+        $lines.Add('    ' + ($bytes -join ', ') + ',')
+    }
+    $lines.Add('};')
+    [IO.File]::WriteAllLines($imageHeader, $lines)
+} else {
+    [IO.File]::WriteAllText($imageHeader, '#define PINBALL_HAS_UPDATE_IMAGE 0')
+}
+
 [IO.File]::WriteAllText($sketchFile, $source)
 Write-Output $sketch

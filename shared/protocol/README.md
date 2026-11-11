@@ -16,8 +16,6 @@ Valid length values are 4 through 134. The largest frame is 135 bytes on the wir
 
 A node validates the frame before acting on it. For unicast, a node consumes frames addressed to it. Otherwise, it decrements TTL and forwards only if the result is positive. A zero-TTL frame is never forwarded. A forwarder preserves the addresses and recomputes the CRC after updating TTL. An initial TTL of 5 covers the five-device ring.
 
-A firmware page payload consists of a two-byte page index relative to the application region and 128 bytes of page data. The coordinator sends one page at a time and waits for the target to acknowledge that page after writing and verifying it. Image size and whole-image integrity are handled at the update level. Command values, page-index byte order, and update session details remain to be specified.
-
 ## Address assignment
 
 The coordinator is address 0. PY32s start at address 15 after reset. Addresses
@@ -50,3 +48,64 @@ and blue. Index 0 is LED1. The length byte is 8 and the total frame is
 9 bytes. The coordinator sends to the assigned node address with TTL 5 for the bench test. Node 1 applies
 the RGB values after validating the CRC and leaves that LED under remote
 control until reset. This command has no reply in the bench implementation.
+
+
+## Command registry
+
+| Value (decimal) | Command | Status |
+|---:|---|---|
+| 1 | Set Address | Implemented |
+| 2 | Node_Config | Implemented. Payload definition pending. |
+| 4 | Set LED color | Implemented |
+| 10 | Firmware Start | Implemented |
+| 11 | Firmware Data | Implemented |
+| 12 | Firmware Apply | Implemented |
+| 13 | DEBUG | Implemented |
+
+## Firmware update
+
+The ESP32 stores the update image and updates one assigned PY32 at a time.
+Each command is unicast. Firmware Start accepts a version strictly greater than the running major/minor pair. Replies swap source and destination and use the same
+command number. Every frame still carries the ring CRC-16.
+
+| Command | ESP32 request payload | PY32 response payload |
+|---|---|---|
+| 10 Firmware Start | Major, minor, 0 | Current major, current minor, status (0 = no update, 1 = update needed) |
+| 11 Firmware Data | Two-byte byte offset, then 1 to 128 image bytes | Same two-byte offset |
+| 12 Firmware Apply | Four-byte image CRC-32, then 0 | Calculated image CRC-32, then status (0 = rejected, 1 = accepted) |
+
+Use byte offsets relative to the start of the application image. Wire
+order for offsets and CRC-32 is most significant byte first. Start at offset
+0 and send contiguous chunks, using 128 bytes except for a possible short
+final chunk. The ESP32 waits for the matching offset ACK before sending the
+next chunk. The receiver validates duplicate retries and re-acknowledges them
+without advancing the accepted image length. The node acknowledges data only after the staging page passes readback. Out-of-order and failed writes receive no ACK. The maximum data frame is 135
+bytes on the wire.
+
+The image check is CRC-32/ISO-HDLC over the exact image bytes, excluding
+any flash-page padding. The check value for ASCII '123456789' is 0xCBF43926.
+Use the end of the last accepted contiguous chunk as the image length.
+A successful Apply reply means the image passed its CRC and is accepted for
+activation. Wait for UART transmission complete before activating or resetting.
+
+After reboot, the updated PY32 is at address 15. The ESP32 sends Set Address
+(command 1) to 15 with the updated node's previous address and waits for that
+node's Node_Config. This recovery assumes the other nodes keep their assigned
+addresses. If multiple nodes reset, run a fresh enumeration with all PY32s reset.
+
+The bootloader reserves separate 8 KiB application and staging regions.
+Firmware Apply checks the staged vectors and CRC, writes a pending record,
+and acknowledges before resetting. At reset the bootloader rechecks staging,
+copies the image into the application region, verifies the application CRC,
+then erases the pending record. A reset during copy leaves the pending record
+available for the next boot to retry. A persistently invalid staged image or
+failed copy requires SWD service. The firmware CRC detects corruption.
+
+## DEBUG
+
+Command 13 carries up to 130 bytes of debug text with destination 0. Send
+plain ASCII or UTF-8 bytes without a terminating NUL. The frame length gives
+the text length. Forwarders apply the usual TTL and CRC rules. The ESP32
+writes the text to USB serial with a `Node <address> debug:` prefix. DEBUG
+has no reply. The PY32 application emits an acknowledgement text such as
+`LED 1 RGB: 25, 0, 0` after applying a Set LED command.

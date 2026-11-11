@@ -6,9 +6,13 @@
 #include "py32f002b_ll_rcc.h"
 #include "py32f002b_ll_usart.h"
 #include <stdbool.h>
-#include <stdio.h>
+#include <stddef.h>
+#if PINBALL_UPDATE_ENABLED
+#include "../../../shared/protocol/firmware_update.h"
+#include "update_flash.h"
+#include <string.h>
+#endif
 
-extern void initialise_monitor_handles(void);
 extern void sk6812_send_frame(volatile uint32_t *bsrr, uint32_t set_mask,
                               uint32_t reset_mask, const uint32_t *early_reset);
 
@@ -34,7 +38,6 @@ static const struct {
     { GPIOA, LL_GPIO_PIN_6, LL_ADC_CHANNEL_3 },
     { GPIOA, LL_GPIO_PIN_4, LL_ADC_CHANNEL_2 },
 };
-static char stdout_buffer[128];
 static bool led_overridden[RING_LED_COUNT];
 static volatile uint32_t uptime_ms;
 /* Receive the next frames while the main loop handles or forwards a packet. */
@@ -247,6 +250,38 @@ static void send_ring_frame(const uint8_t *frame, size_t count)
     }
 }
 
+static uint8_t *append_color_value(uint8_t *out, uint8_t value)
+{
+    if (value >= 100U) {
+        *out++ = (uint8_t)('0' + value / 100U);
+    }
+    if (value >= 10U) {
+        *out++ = (uint8_t)('0' + value / 10U % 10U);
+    }
+    *out++ = (uint8_t)('0' + value % 10U);
+    return out;
+}
+
+static void send_led_debug(uint8_t index, uint32_t grb)
+{
+    /* Three header bytes, eleven prefix bytes, nine digits, two separators and CRC. */
+    uint8_t frame[3 + 11 + 9 + 4 + 2] = {
+        0, (uint8_t)(node_address << 4), (RING_TTL << 4) | RING_DEBUG,
+        'L', 'E', 'D', ' ', (uint8_t)('1' + index), ' ', 'R', 'G', 'B', ':', ' '
+    };
+    uint8_t *out = append_color_value(frame + 14, (uint8_t)(grb >> 8));
+    *out++ = ',';
+    *out++ = ' ';
+    out = append_color_value(out, (uint8_t)(grb >> 16));
+    *out++ = ',';
+    *out++ = ' ';
+    out = append_color_value(out, (uint8_t)grb);
+    const size_t count = (size_t)(out - frame) + 2U;
+    frame[0] = (uint8_t)(count - 1U);
+    ring_write_crc(frame, count);
+    send_ring_frame(frame, count);
+}
+
 static void assign_ring_address(uint8_t origin, uint8_t address_byte)
 {
     const uint8_t address = address_byte & 0x0FU;
@@ -267,6 +302,81 @@ static void assign_ring_address(uint8_t origin, uint8_t address_byte)
     ring_build_address_frame(frame, node_address, origin, RING_NODE_CONFIG, 0);
     send_ring_frame(frame, sizeof frame);
 }
+
+#if PINBALL_UPDATE_ENABLED
+_Static_assert(PINBALL_VERSION_MAJOR >= 0 && PINBALL_VERSION_MAJOR <= 255 &&
+               PINBALL_VERSION_MINOR >= 0 && PINBALL_VERSION_MINOR <= 255,
+               "Firmware version fields must fit one byte");
+
+static bool update_active;
+static uint16_t update_size;
+
+uint32_t HAL_GetTick(void)
+{
+    return uptime_ms;
+}
+
+static void send_update_reply(uint8_t command, const uint8_t *payload, size_t length)
+{
+    uint8_t reply[10];
+    const size_t count = length + 5U;
+    reply[0] = (uint8_t)(count - 1U);
+    reply[1] = (uint8_t)(node_address << 4);
+    reply[2] = (RING_TTL << 4) | command;
+    memcpy(reply + 3, payload, length);
+    ring_write_crc(reply, count);
+    send_ring_frame(reply, count);
+}
+
+static void handle_firmware_command(uint8_t command, const uint8_t *payload, size_t length)
+{
+    if (command == RING_FIRMWARE_START && length == 3 && payload[2] == 0U) {
+        const uint16_t requested = ((uint16_t)payload[0] << 8) | payload[1];
+        const uint16_t current = (PINBALL_VERSION_MAJOR << 8) | PINBALL_VERSION_MINOR;
+        update_active = requested > current;
+        update_size = 0;
+        const uint8_t reply[] = {PINBALL_VERSION_MAJOR, PINBALL_VERSION_MINOR, update_active};
+        send_update_reply(command, reply, sizeof reply);
+    } else if (command == RING_FIRMWARE_DATA && update_active &&
+               length >= 3U && length <= 2U + RING_FIRMWARE_PAGE_BYTES) {
+        const uint16_t offset = ((uint16_t)payload[0] << 8) | payload[1];
+        const size_t bytes = length - 2U;
+        if ((offset % RING_FIRMWARE_PAGE_BYTES) != 0U ||
+            offset + bytes > RING_FIRMWARE_SLOT_BYTES) {
+            return;
+        }
+
+        const uint32_t address = UPDATE_STAGE_BASE + offset;
+        if (offset + bytes <= update_size &&
+            memcmp((const void *)address, payload + 2, bytes) == 0) {
+            send_update_reply(command, payload, 2);
+        } else if (offset == update_size && update_write_page(address, payload + 2, bytes)) {
+            update_size += (uint16_t)bytes;
+            send_update_reply(command, payload, 2);
+        }
+    } else if (command == RING_FIRMWARE_APPLY && update_active &&
+               length == 5U && payload[4] == 0U) {
+        const uint32_t crc = firmware_crc32((const uint8_t *)UPDATE_STAGE_BASE, update_size);
+        bool accepted = false;
+        if (crc == firmware_read_be32(payload) &&
+            update_vectors_valid(UPDATE_STAGE_BASE, update_size)) {
+            update_record_t record = {UPDATE_PENDING_MAGIC, update_size, crc, 0};
+            record.record_crc = firmware_crc32((const uint8_t *)&record,
+                                                offsetof(update_record_t, record_crc));
+            accepted = update_write_page(UPDATE_METADATA_BASE, &record, sizeof record);
+        }
+        uint8_t reply[5];
+        firmware_write_be32(reply, crc);
+        reply[4] = accepted;
+        send_update_reply(command, reply, sizeof reply);
+        if (accepted) {
+            while (!LL_USART_IsActiveFlag_TC(USART1)) {
+            }
+            NVIC_SystemReset();
+        }
+    }
+}
+#endif
 
 static void handle_ring_frame(bool led_timing_ok)
 {
@@ -297,6 +407,11 @@ static void handle_ring_frame(bool led_timing_ok)
                                      ((uint32_t)frame[4] << 8) | frame[6];
                 led_overridden[index] = true;
                 show_led_color(index, grb);
+                send_led_debug(index, grb);
+#if PINBALL_UPDATE_ENABLED
+            } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR) {
+                handle_firmware_command(command, frame + 3, count - 5U);
+#endif
             }
         } else if (ttl > 1U) {
             frame[2] = (uint8_t)(((ttl - 1U) << 4) | command);
@@ -333,15 +448,6 @@ int main(void)
         if (hall_adc_ready) {
             scan_hall_inputs();
         }
-    }
-
-    /* DHCSR bit 0 indicates halting debug is enabled. */
-    const volatile uint32_t *const debug_status = (const volatile uint32_t *)0xE000EDF0UL;
-    if ((*debug_status & 1U) != 0U) {
-        initialise_monitor_handles();
-        setvbuf(stdout, stdout_buffer, _IOLBF, sizeof stdout_buffer);
-        printf("PinballDriver: PY32 semihosting ready. Core clock: %lu Hz\n",
-               (unsigned long)SystemCoreClock);
     }
 
     SysTick_Config(SystemCoreClock / 1000U);

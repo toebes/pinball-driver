@@ -16,6 +16,7 @@ enum {
     RING_ADDRESS_FRAME_SIZE = 6,
     RING_TTL = 5,
     RING_SET_LED = 4,
+    RING_DEBUG = 13,
     RING_LED_COUNT = 6,
     RING_MIN_LENGTH = 4,
     RING_MAX_LENGTH = 134,

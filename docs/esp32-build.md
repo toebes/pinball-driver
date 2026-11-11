@@ -17,3 +17,10 @@ If Windows reports that the command line is too long, use short paths for the Ar
 Back up the development board's factory flash before the first upload. Then run `arduino-cli upload --fqbn $board -p COM4 --input-dir build/esp32 $sketch` with the board's actual serial port. Open a serial monitor at 115200 baud to see transmitted frames and Node_Config replies.
 
 After resetting the PY32s, tap **Assign Addresses** once. The 18 RGB buttons send LED commands to Node 1. The full ring was verified by receiving Node_Config replies from nodes 1 through 4.
+
+For ring updates, build the relocated `py32_app` target and supply its build
+directory to `prepare-esp32-demo.ps1 -Py32Build`. The script embeds the binary
+and reads its major/minor version from the CMake cache. Omitting `-Py32Build`
+builds the coordinator without an update image. Assign all four addresses
+before updating, select the target node, and tap **Update 0.2**. The coordinator
+confirms the version after reboot and address reassignment.
