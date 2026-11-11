@@ -19,6 +19,7 @@ extern void sk6812_send_frame(volatile uint32_t *bsrr, uint32_t set_mask,
 /* Inspect this counter in the debugger. */
 volatile uint32_t heartbeat_count;
 enum { HALL_PORT_COUNT = 6, HALL_BASELINE_SAMPLES = 8 };
+enum { PORT_IDLE_TIMEOUT_MS = 1000, PORT_IDLE_STEP_MS = 500 };
 volatile uint16_t hall_adc_raw[HALL_PORT_COUNT];
 volatile uint16_t hall_baseline[HALL_PORT_COUNT];
 volatile bool hall_baseline_ready[HALL_PORT_COUNT];
@@ -39,6 +40,11 @@ static const struct {
     { GPIOA, LL_GPIO_PIN_4, LL_ADC_CHANNEL_2 },
 };
 static bool led_overridden[RING_LED_COUNT];
+static uint8_t port_types[RING_LED_COUNT];
+static uint32_t port_colors[RING_LED_COUNT];
+static uint32_t displayed_colors[RING_LED_COUNT];
+static uint32_t last_message_ms;
+static bool ports_idle;
 static bool hall_adc_ready;
 static bool sensor_monitoring;
 static uint8_t monitored_port;
@@ -95,14 +101,13 @@ void USART1_IRQHandler(void)
 static const struct {
     GPIO_TypeDef *port;
     uint32_t pin;
-    uint32_t grb;
-} leds[] = {
-    { GPIOA, LL_GPIO_PIN_0, 0x060000 }, /* Port 1: green */
-    { GPIOA, LL_GPIO_PIN_1, 0x000600 }, /* Port 2: red */
-    { GPIOA, LL_GPIO_PIN_5, 0x000006 }, /* Port 3: blue */
-    { GPIOB, LL_GPIO_PIN_2, 0x060600 }, /* Port 4: yellow */
-    { GPIOB, LL_GPIO_PIN_7, 0x060006 }, /* Port 5: cyan */
-    { GPIOB, LL_GPIO_PIN_3, 0x000606 }, /* Port 6: magenta */
+} leds[RING_LED_COUNT] = {
+    { GPIOA, LL_GPIO_PIN_0 },
+    { GPIOA, LL_GPIO_PIN_1 },
+    { GPIOA, LL_GPIO_PIN_5 },
+    { GPIOB, LL_GPIO_PIN_2 },
+    { GPIOB, LL_GPIO_PIN_7 },
+    { GPIOB, LL_GPIO_PIN_3 },
 };
 
 static void configure_node1_ports(void)
@@ -121,6 +126,7 @@ static void configure_node1_ports(void)
         LL_GPIO_SetPinOutputType(port, pin, LL_GPIO_OUTPUT_PUSHPULL);
         LL_GPIO_SetPinSpeed(port, pin, LL_GPIO_SPEED_FREQ_HIGH);
         LL_GPIO_SetPinMode(port, pin, LL_GPIO_MODE_OUTPUT);
+        displayed_colors[i] = UINT32_MAX;
     }
 }
 
@@ -221,18 +227,27 @@ static void scan_hall_inputs(void)
         uint16_t sample;
         if (sample_hall_input(port, &sample)) {
             track_hall_sample(port, sample);
-            if (port == 0U && !led_overridden[port]) {
-                show_led_color(0, hall_ball_present[0] ? 0x190000U : 0x000300U);
+            if (port_types[port] == RING_PORT_LED_HALL && !led_overridden[port]) {
+                port_colors[port] = hall_ball_present[port] ? 0x190000U : 0x000300U;
             }
         }
     }
 }
 
-static void show_port_colors(size_t color_offset)
+static bool port_is_servo(size_t port)
 {
-    for (size_t i = 1; i < sizeof leds / sizeof leds[0]; ++i) {
-        if (!led_overridden[i]) {
-            show_led_color(i, leds[(i + color_offset) % (sizeof leds / sizeof leds[0])].grb);
+    return port_types[port] >= RING_PORT_SERVO;
+}
+
+static void refresh_port_colors(size_t idle_color_index)
+{
+    static const uint32_t idle_colors[] = {0x001000U, 0x100000U, 0x000010U};
+    for (size_t port = 0; port < RING_LED_COUNT; ++port) {
+        const uint32_t color = ports_idle ? idle_colors[idle_color_index] :
+                               port_is_servo(port) ? 0U : port_colors[port];
+        if (displayed_colors[port] != color) {
+            show_led_color(port, color);
+            displayed_colors[port] = color;
         }
     }
 }
@@ -458,18 +473,24 @@ static void handle_ring_frame(bool led_timing_ok)
     const uint16_t expected_crc = ((uint16_t)frame[count - 2] << 8) | frame[count - 1];
 
     if (origin != node_address && expected_crc == ring_crc16(frame, count - 2)) {
+        last_message_ms = uptime_ms;
+        ports_idle = false;
         if (destination == node_address) {
             if (node_address == RING_UNASSIGNED && command == RING_SET_ADDRESS &&
                 count == RING_ADDRESS_FRAME_SIZE) {
                 assign_ring_address(origin, frame[3]);
+            } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR &&
+                       command == RING_SET_PORT_TYPE && count == RING_PORT_TYPE_FRAME_SIZE &&
+                       frame[3] < RING_LED_COUNT && frame[4] <= RING_PORT_SERVO_FEEDBACK) {
+                port_types[frame[3]] = frame[4];
             } else if (node_address != RING_UNASSIGNED && led_timing_ok &&
                        command == RING_SET_LED && count == RING_LED_FRAME_SIZE &&
-                       frame[3] < RING_LED_COUNT) {
+                       frame[3] < RING_LED_COUNT && !port_is_servo(frame[3])) {
                 const uint8_t index = frame[3];
                 const uint32_t grb = ((uint32_t)frame[5] << 16) |
                                      ((uint32_t)frame[4] << 8) | frame[6];
                 led_overridden[index] = true;
-                show_led_color(index, grb);
+                port_colors[index] = grb;
                 send_led_debug(index, grb);
             } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR &&
                        command == RING_MONITOR_SENSOR && count == RING_SENSOR_FRAME_SIZE &&
@@ -511,10 +532,6 @@ int main(void)
         for (uint32_t cycle = 0; cycle < 240000U; ++cycle) {
             __NOP();
         }
-        show_port_colors(0);
-        if (PINBALL_ENABLE_HALL_ADC && hall_adc_ready) {
-            scan_hall_inputs();
-        }
     }
 
     SysTick_Config(SystemCoreClock / 1000U);
@@ -523,22 +540,28 @@ int main(void)
     NVIC_EnableIRQ(USART1_IRQn);
 
     uint32_t last_refresh = uptime_ms;
-    size_t color_offset = 0;
-    unsigned refresh_ticks = 0;
+    uint32_t last_idle_change = 0;
+    size_t idle_color_index = 0;
     for (;;) {
         ++heartbeat_count;
         handle_ring_frame(led_timing_ok);
         const uint32_t now = uptime_ms;
         report_sensor_sample(now);
-        if (led_timing_ok && now - last_refresh >= 50U) {
+        if (!ports_idle && now - last_message_ms >= PORT_IDLE_TIMEOUT_MS) {
+            ports_idle = true;
+            idle_color_index = 0;
+            last_idle_change = now;
+        } else if (ports_idle && now - last_idle_change >= PORT_IDLE_STEP_MS) {
+            idle_color_index = (idle_color_index + 1U) % 3U;
+            last_idle_change = now;
+        }
+        if (led_timing_ok) {
+            refresh_port_colors(idle_color_index);
+        }
+        if (!ports_idle && now - last_refresh >= 50U) {
             last_refresh = now;
             if (PINBALL_ENABLE_HALL_ADC && hall_adc_ready) {
                 scan_hall_inputs();
-            }
-            if (++refresh_ticks == 20U) {
-                refresh_ticks = 0;
-                color_offset = (color_offset + 1U) % RING_LED_COUNT;
-                show_port_colors(color_offset);
             }
         }
     }

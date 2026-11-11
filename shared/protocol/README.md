@@ -41,13 +41,54 @@ destination, decrementing TTL and updating CRC. The coordinator consumes
 Node_Config replies and drops its own returning Set Address frame. Reset the
 PY32s before a fresh enumeration so they all start at 15.
 
+## Set Port Type
+
+Command 3 carries two payload bytes from the coordinator to an assigned
+node. The first is the port index (0 for Port 1 through 5 for Port 6). The
+second is the port type. The length byte is 6, the complete frame is 7 bytes,
+and the coordinator sends with TTL 5. There is no reply.
+
+| Value | Port type |
+|---:|---|
+| 0 | Undefined |
+| 1 | LED output only |
+| 2 | LED with Hall Effect Sensor |
+| 3 | Standard Servo |
+| 4 | Servo with Position feedback |
+
+Port types start as undefined and are held in RAM until reset. The two
+servo types reserve the port for servo control. PWM and position feedback
+control are pending. In builds with automatic Hall sampling enabled,
+type 2 enables the Hall-based LED indication until a Set LED color
+command overrides it. On-demand Monitor_Sensor works independently.
+
+## IDLE and ring inactivity
+
+Command 0 (IDLE) has no payload and no reply. Its length byte is 4 and
+the complete frame is 5 bytes. Only the ESP32 originates IDLE, using source 0,
+destination 14, and an initial TTL equal to the number of PY32s in the ring
+(4 on the current board). Each node counts the frame as activity and forwards
+it with the usual TTL and CRC rules. The last node receives it with TTL 1.
+
+The coordinator waits 1 second after startup or its last non-IDLE
+transmission, then sends IDLE every 500 ms. Any outgoing non-IDLE frame
+restarts the 1-second wait.
+
+After 1 second without receiving a valid frame from another address,
+including after startup, each PY32 shows red, green, then blue on all
+six ports at brightness 16 out of 256, changing every 500 ms. Frames
+addressed elsewhere also count as activity. The next valid frame restores
+normal output using the colors and port types retained during the timeout,
+with any changes made by that frame.
+
 ## Set LED color
 
 Command 4 carries four bytes in order: LED index (0 through 5), red, green,
 and blue. Index 0 is LED1. The length byte is 8 and the total frame is
 9 bytes. The coordinator sends to the selected node address with TTL 5. The target applies
 the RGB values after validating the CRC and leaves that LED under remote
-control until reset. This command has no reply in the bench implementation.
+control until reset. Servo ports ignore Set LED color. The target sends a
+DEBUG message with the RGB values after accepting the command.
 
 
 ## Monitor_Sensor
@@ -71,8 +112,10 @@ An accepted firmware update stops monitoring on its target.
 
 | Value (decimal) | Command | Status |
 |---:|---|---|
+| 0 | IDLE | Implemented |
 | 1 | Set Address | Implemented |
 | 2 | Node_Config | Implemented. Payload definition pending. |
+| 3 | Set Port Type | Implemented. Servo control pending. |
 | 4 | Set LED color | Implemented |
 | 5 | Monitor_Sensor | Implemented |
 | 10 | Firmware Start | Implemented |

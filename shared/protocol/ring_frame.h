@@ -10,11 +10,16 @@ enum {
     RING_LAST_UNICAST = 13,
     RING_MULTICAST = 14,
     RING_UNASSIGNED = 15,
+    RING_NODE_COUNT = 4,
     RING_ASSIGNMENT_TTL = 15,
+    RING_IDLE = 0,
+    RING_IDLE_FRAME_SIZE = 5,
     RING_SET_ADDRESS = 1,
     RING_NODE_CONFIG = 2,
     RING_ADDRESS_FRAME_SIZE = 6,
     RING_TTL = 5,
+    RING_SET_PORT_TYPE = 3,
+    RING_PORT_TYPE_FRAME_SIZE = 7,
     RING_SET_LED = 4,
     RING_MONITOR_SENSOR = 5,
     RING_SENSOR_FRAME_SIZE = 7,
@@ -25,6 +30,14 @@ enum {
     RING_MAX_LENGTH = 134,
     RING_LED_FRAME_SIZE = 9,
     RING_IDLE_GAP_MS = 20
+};
+
+enum {
+    RING_PORT_UNDEFINED = 0,
+    RING_PORT_LED = 1,
+    RING_PORT_LED_HALL = 2,
+    RING_PORT_SERVO = 3,
+    RING_PORT_SERVO_FEEDBACK = 4
 };
 
 static inline uint16_t ring_crc16(const uint8_t *bytes, size_t count)
@@ -46,6 +59,14 @@ static inline void ring_write_crc(uint8_t *frame, size_t size)
     frame[size - 1] = (uint8_t)crc;
 }
 
+static inline void ring_build_idle(uint8_t *frame)
+{
+    frame[0] = RING_IDLE_FRAME_SIZE - 1;
+    frame[1] = (RING_COORDINATOR << 4) | RING_MULTICAST;
+    frame[2] = (RING_NODE_COUNT << 4) | RING_IDLE;
+    ring_write_crc(frame, RING_IDLE_FRAME_SIZE);
+}
+
 static inline void ring_build_address_frame(uint8_t *frame, uint8_t source,
                                             uint8_t destination, uint8_t command,
                                             uint8_t payload)
@@ -55,6 +76,17 @@ static inline void ring_build_address_frame(uint8_t *frame, uint8_t source,
     frame[2] = (RING_ASSIGNMENT_TTL << 4) | command;
     frame[3] = payload;
     ring_write_crc(frame, RING_ADDRESS_FRAME_SIZE);
+}
+
+static inline void ring_build_set_port_type(uint8_t *frame, uint8_t destination,
+                                            uint8_t index, uint8_t type)
+{
+    frame[0] = RING_PORT_TYPE_FRAME_SIZE - 1;
+    frame[1] = (RING_COORDINATOR << 4) | destination;
+    frame[2] = (RING_TTL << 4) | RING_SET_PORT_TYPE;
+    frame[3] = index;
+    frame[4] = type;
+    ring_write_crc(frame, RING_PORT_TYPE_FRAME_SIZE);
 }
 
 static inline void ring_build_set_led(uint8_t *frame, uint8_t destination, uint8_t index,

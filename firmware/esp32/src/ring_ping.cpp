@@ -6,12 +6,17 @@
 
 namespace {
 constexpr size_t history_size = 5;
+constexpr uint32_t idle_start_ms = 1000;
+constexpr uint32_t idle_period_ms = 500;
+uint32_t last_tx_ms;
+uint32_t idle_delay_ms = idle_start_ms;
 lv_obj_t *node_selector;
 lv_obj_t *port_button;
 lv_obj_t *port_label;
 lv_obj_t *sliders[3];
 lv_obj_t *slider_labels[3];
 lv_obj_t *monitor_label;
+lv_obj_t *port_type_selector;
 lv_obj_t *readings_label;
 lv_obj_t *status_label;
 uint8_t selected_port;
@@ -30,6 +35,28 @@ uint8_t config_rx[RING_MAX_LENGTH + 1];
 size_t config_rx_size;
 uint32_t last_rx_ms;
 bool discard_rx;
+
+bool send_ring_frame(const uint8_t *frame, size_t size)
+{
+    if (Serial1.write(frame, size) != size) {
+        return false;
+    }
+    last_tx_ms = millis();
+    idle_delay_ms = idle_start_ms;
+    return true;
+}
+
+void poll_idle()
+{
+    if (millis() - last_tx_ms < idle_delay_ms) {
+        return;
+    }
+    uint8_t frame[RING_IDLE_FRAME_SIZE];
+    ring_build_idle(frame);
+    if (send_ring_frame(frame, sizeof frame)) {
+        idle_delay_ms = idle_period_ms;
+    }
+}
 
 void log_ring_tx(const uint8_t *frame, size_t size)
 {
@@ -67,7 +94,7 @@ void transmit_update(uint8_t destination, uint8_t command, const uint8_t *payloa
     outgoing[2] = (ttl << 4) | command;
     memcpy(outgoing + 3, payload, length);
     ring_write_crc(outgoing, outgoing_size);
-    Serial1.write(outgoing, outgoing_size);
+    send_ring_frame(outgoing, outgoing_size);
     retries = 0;
     deadline = millis() + 750;
 }
@@ -170,7 +197,7 @@ void poll_update()
     } else if ((update_step == UpdateStep::Start || update_step == UpdateStep::Data ||
                 update_step == UpdateStep::Verify) && retries < 2) {
         ++retries;
-        Serial1.write(outgoing, outgoing_size);
+        send_ring_frame(outgoing, outgoing_size);
         deadline = millis() + 750;
     } else {
         finish_update("Update timed out. Check the ring.");
@@ -192,7 +219,7 @@ void start_address_assignment(lv_event_t *)
     uint8_t frame[RING_ADDRESS_FRAME_SIZE];
     ring_build_address_frame(frame, RING_COORDINATOR, RING_UNASSIGNED,
                              RING_SET_ADDRESS, RING_NODE_1);
-    if (Serial1.write(frame, sizeof frame) == sizeof frame) {
+    if (send_ring_frame(frame, sizeof frame)) {
         log_ring_tx(frame, sizeof frame);
         lv_label_set_text(status_label, "Address assignment sent");
     } else {
@@ -227,7 +254,7 @@ void send_color(lv_event_t *)
     const uint8_t blue = static_cast<uint8_t>(lv_slider_get_value(sliders[2]));
     uint8_t frame[RING_LED_FRAME_SIZE];
     ring_build_set_led(frame, node, selected_port, red, green, blue);
-    if (Serial1.write(frame, sizeof frame) != sizeof frame) {
+    if (!send_ring_frame(frame, sizeof frame)) {
         lv_label_set_text(status_label, "UART send failed");
         return;
     }
@@ -236,6 +263,26 @@ void send_color(lv_event_t *)
                           static_cast<unsigned>(red), static_cast<unsigned>(green),
                           static_cast<unsigned>(blue));
     log_ring_tx(frame, sizeof frame);
+}
+
+void send_port_type(lv_event_t *)
+{
+#if PINBALL_HAS_UPDATE_IMAGE
+    if (update_step != UpdateStep::Idle) {
+        return;
+    }
+#endif
+    const uint8_t node = selected_node();
+    const uint8_t type = static_cast<uint8_t>(lv_dropdown_get_selected(port_type_selector));
+    uint8_t frame[RING_PORT_TYPE_FRAME_SIZE];
+    ring_build_set_port_type(frame, node, selected_port, type);
+    if (!send_ring_frame(frame, sizeof frame)) {
+        lv_label_set_text(status_label, "UART send failed");
+        return;
+    }
+    log_ring_tx(frame, sizeof frame);
+    lv_label_set_text_fmt(status_label, "Port type sent to node %u, port %u",
+                          static_cast<unsigned>(node), static_cast<unsigned>(selected_port + 1U));
 }
 
 void toggle_monitor(lv_event_t *)
@@ -250,7 +297,7 @@ void toggle_monitor(lv_event_t *)
     const uint8_t port = start ? selected_port : monitor_port;
     uint8_t frame[RING_SENSOR_FRAME_SIZE];
     ring_build_sensor_frame(frame, RING_COORDINATOR, node, port, start ? 1 : 0);
-    if (Serial1.write(frame, sizeof frame) != sizeof frame) {
+    if (!send_ring_frame(frame, sizeof frame)) {
         lv_label_set_text(status_label, "UART send failed");
         return;
     }
@@ -318,6 +365,7 @@ lv_obj_t *make_button(lv_obj_t *parent, const char *text, lv_coord_t x, lv_coord
 void led_control_screen_begin()
 {
     Serial1.begin(115200, SERIAL_8N1, 18, 17);
+    last_tx_ms = millis();
 
     lv_obj_t *screen = lv_scr_act();
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -342,9 +390,16 @@ void led_control_screen_begin()
                           static_cast<unsigned>(image_minor));
 #endif
 
+    port_type_selector = lv_dropdown_create(screen);
+    lv_dropdown_set_options(port_type_selector,
+                            "Undefined\nLED only\nLED + Hall sensor\nStandard servo\nServo + position feedback");
+    lv_obj_set_size(port_type_selector, 229, 42);
+    lv_obj_set_pos(port_type_selector, 44, 66);
+    make_button(screen, "Set Port Type", 283, 66, 131, send_port_type);
+
     lv_obj_t *led_title = lv_label_create(screen);
     lv_label_set_text(led_title, "LED Color");
-    lv_obj_set_pos(led_title, 44, 104);
+    lv_obj_set_pos(led_title, 44, 115);
     const char *labels[] = {"R  0", "G  0", "B  0"};
     const uint32_t colors[] = {0xC62828, 0x16834A, 0x2455C3};
     for (size_t i = 0; i < 3; ++i) {
@@ -445,4 +500,5 @@ void led_control_screen_poll()
 #if PINBALL_HAS_UPDATE_IMAGE
     poll_update();
 #endif
+    poll_idle();
 }

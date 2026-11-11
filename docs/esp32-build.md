@@ -18,9 +18,14 @@ Back up the development board's factory flash before the first upload. Then run 
 
 After resetting the PY32s, tap **Assign Addresses** once. Select a node and use the Port button to cycle through ports 1–6. Set LED sends the three RGB slider values. Start Monitoring streams Hall readings for that node and port until Stop Monitoring is tapped. The full ring was verified by receiving Node_Config replies from nodes 1 through 4.
 
+Choose a type from the port type dropdown and tap **Set Port Type** to send it
+to the selected node and port. The dropdown selects what to send. A node
+enters its RGB idle cycle after a second without incoming ring frames.
+
 For ring updates, build the relocated `py32_app` target and supply its build
 directory to `prepare-esp32-demo.ps1 -Py32Build`. The script embeds the binary
 and reads its major/minor version from the CMake cache. Omitting `-Py32Build`
 builds the coordinator without an update image. Assign all four addresses
-before updating, select the target node, and tap **Update 0.4**. The coordinator
+before updating, select the target node, and tap the **Update** button showing
+the embedded version. The coordinator
 confirms the version after reboot and address reassignment.

@@ -54,7 +54,7 @@ Use the standalone `py32_smoke.elf` only on a board where you intend to
 replace the resident bootloader. It is linked at the flash base. For an
 installed bootloader, load application symbols from `py32_app.elf`.
 
-Firmware commands 10 through 12 stage and verify an application image, then request activation by the resident bootloader. The default application version is 0.4. Set -DPINBALL_VERSION_MINOR=0 in a separate bench build to create an older test target.
+Firmware commands 10 through 12 stage and verify an application image, then request activation by the resident bootloader. The default application version is 0.5. Pass `-DPINBALL_VERSION_MINOR=5` when reconfiguring a build directory with an older cached version. Set `-DPINBALL_VERSION_MINOR=0` in a separate bench build to create an older test target.
 
 Application diagnostics can travel as DEBUG packets to the ESP32 USB serial
 log. Only one OpenOCD session can use the ST-LINK at a time.
