@@ -45,10 +45,27 @@ PY32s before a fresh enumeration so they all start at 15.
 
 Command 4 carries four bytes in order: LED index (0 through 5), red, green,
 and blue. Index 0 is LED1. The length byte is 8 and the total frame is
-9 bytes. The coordinator sends to the assigned node address with TTL 5 for the bench test. Node 1 applies
+9 bytes. The coordinator sends to the selected node address with TTL 5. The target applies
 the RGB values after validating the CRC and leaves that LED under remote
 control until reset. This command has no reply in the bench implementation.
 
+
+## Monitor_Sensor
+
+Command 5 carries two payload bytes. The length byte is 6 and the complete
+frame is 7 bytes. Port index 0 corresponds to Port 1 and index 5 to Port 6.
+
+| Direction | Byte 0 | Byte 1 |
+|---|---|---|
+| Coordinator to selected PY32 | Port index | 1 starts monitoring, 0 stops |
+| PY32 to coordinator | Port index | Scaled ADC reading, 0 through 255 |
+
+An assigned node reports one selected port every 250 ms while monitoring.
+A start request selects or replaces the monitored port. A stop request ends
+monitoring for the specified port. The 12-bit ADC range maps to 0 through 255
+with rounding. The ESP32 shows the last five readings with the newest first
+and prints received samples to USB serial. The request has no separate ACK.
+An accepted firmware update stops monitoring on its target.
 
 ## Command registry
 
@@ -57,6 +74,7 @@ control until reset. This command has no reply in the bench implementation.
 | 1 | Set Address | Implemented |
 | 2 | Node_Config | Implemented. Payload definition pending. |
 | 4 | Set LED color | Implemented |
+| 5 | Monitor_Sensor | Implemented |
 | 10 | Firmware Start | Implemented |
 | 11 | Firmware Data | Implemented |
 | 12 | Firmware Apply | Implemented |

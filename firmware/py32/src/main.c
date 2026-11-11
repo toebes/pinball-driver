@@ -39,6 +39,10 @@ static const struct {
     { GPIOA, LL_GPIO_PIN_4, LL_ADC_CHANNEL_2 },
 };
 static bool led_overridden[RING_LED_COUNT];
+static bool hall_adc_ready;
+static bool sensor_monitoring;
+static uint8_t monitored_port;
+static uint32_t last_sensor_report;
 static volatile uint32_t uptime_ms;
 /* Receive the next frames while the main loop handles or forwards a packet. */
 enum { RING_RX_SLOTS = 4 };
@@ -134,7 +138,6 @@ static bool configure_hall_adc(void)
             for (unsigned cycle = 0; cycle < 32U; ++cycle) {
                 __NOP();
             }
-            LL_ADC_Enable(ADC1);
             return true;
         }
     }
@@ -181,24 +184,45 @@ static void track_hall_sample(size_t port, uint16_t sample)
     }
 }
 
+static bool sample_hall_input(size_t port, uint16_t *sample)
+{
+    if (LL_ADC_REG_IsConversionOngoing(ADC1)) {
+        return false;
+    }
+    const uint32_t channel = hall_inputs[port].channel;
+    const uint32_t channel_mask = channel & ADC_CHSELR_CHSEL;
+    if (ADC1->CHSELR != channel_mask || !LL_ADC_IsEnabled(ADC1)) {
+        /* This device ignores channel writes while ADEN is set. */
+        LL_ADC_Disable(ADC1);
+        LL_ADC_REG_SetSequencerChannels(ADC1, channel);
+        if (ADC1->CHSELR != channel_mask) {
+            return false;
+        }
+        LL_ADC_Enable(ADC1);
+        /* Allow at least eight ADC clocks at PCLK divided by four. */
+        for (unsigned cycle = 0; cycle < 64U; ++cycle) {
+            __NOP();
+        }
+    }
+    LL_ADC_ClearFlag_EOC(ADC1);
+    LL_ADC_REG_StartConversion(ADC1);
+    for (unsigned attempt = 0; attempt < 24000U; ++attempt) {
+        if (LL_ADC_IsActiveFlag_EOC(ADC1)) {
+            *sample = LL_ADC_REG_ReadConversionData12(ADC1);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void scan_hall_inputs(void)
 {
     for (size_t port = 0; port < HALL_PORT_COUNT; ++port) {
-        if (LL_ADC_REG_IsConversionOngoing(ADC1)) {
-            return;
-        }
-        LL_ADC_REG_SetSequencerChannels(ADC1, hall_inputs[port].channel);
-        LL_ADC_ClearFlag_EOC(ADC1);
-        LL_ADC_REG_StartConversion(ADC1);
-        for (unsigned attempt = 0; attempt < 24000U; ++attempt) {
-            if (LL_ADC_IsActiveFlag_EOC(ADC1)) {
-                const uint16_t sample = LL_ADC_REG_ReadConversionData12(ADC1);
-                track_hall_sample(port, sample);
-                if (port == 0U && !led_overridden[port]) {
-                    /* SK6812 uses GRB order. Show dim red while clear. */
-                    show_led_color(0, hall_ball_present[0] ? 0x190000U : 0x000300U);
-                }
-                break;
+        uint16_t sample;
+        if (sample_hall_input(port, &sample)) {
+            track_hall_sample(port, sample);
+            if (port == 0U && !led_overridden[port]) {
+                show_led_color(0, hall_ball_present[0] ? 0x190000U : 0x000300U);
             }
         }
     }
@@ -247,6 +271,42 @@ static void send_ring_frame(const uint8_t *frame, size_t count)
         while (!LL_USART_IsActiveFlag_TXE(USART1)) {
         }
         LL_USART_TransmitData8(USART1, frame[i]);
+    }
+}
+
+static void configure_sensor_monitor(uint8_t port, uint8_t enable)
+{
+    if (enable == 0U) {
+        if (sensor_monitoring && monitored_port == port) {
+            sensor_monitoring = false;
+        }
+        return;
+    }
+
+    if (!hall_adc_ready) {
+        hall_adc_ready = configure_hall_adc();
+    }
+    if (hall_adc_ready) {
+        monitored_port = port;
+        last_sensor_report = uptime_ms;
+        sensor_monitoring = true;
+    }
+}
+
+static void report_sensor_sample(uint32_t now)
+{
+    if (!sensor_monitoring || now - last_sensor_report < RING_SENSOR_PERIOD_MS) {
+        return;
+    }
+
+    last_sensor_report = now;
+    uint16_t sample;
+    if (sample_hall_input(monitored_port, &sample)) {
+        hall_adc_raw[monitored_port] = sample;
+        const uint8_t scaled = (uint8_t)(((uint32_t)sample * 255U + 2047U) / 4095U);
+        uint8_t frame[RING_SENSOR_FRAME_SIZE];
+        ring_build_sensor_frame(frame, node_address, RING_COORDINATOR, monitored_port, scaled);
+        send_ring_frame(frame, sizeof frame);
     }
 }
 
@@ -335,6 +395,9 @@ static void handle_firmware_command(uint8_t command, const uint8_t *payload, siz
         const uint16_t current = (PINBALL_VERSION_MAJOR << 8) | PINBALL_VERSION_MINOR;
         update_active = requested > current;
         update_size = 0;
+        if (update_active) {
+            sensor_monitoring = false;
+        }
         const uint8_t reply[] = {PINBALL_VERSION_MAJOR, PINBALL_VERSION_MINOR, update_active};
         send_update_reply(command, reply, sizeof reply);
     } else if (command == RING_FIRMWARE_DATA && update_active &&
@@ -408,6 +471,10 @@ static void handle_ring_frame(bool led_timing_ok)
                 led_overridden[index] = true;
                 show_led_color(index, grb);
                 send_led_debug(index, grb);
+            } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR &&
+                       command == RING_MONITOR_SENSOR && count == RING_SENSOR_FRAME_SIZE &&
+                       frame[3] < HALL_PORT_COUNT && frame[4] <= 1U) {
+                configure_sensor_monitor(frame[3], frame[4]);
 #if PINBALL_UPDATE_ENABLED
             } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR) {
                 handle_firmware_command(command, frame + 3, count - 5U);
@@ -438,14 +505,14 @@ int main(void)
     SystemCoreClockUpdate();
     configure_ring_uart();
     const bool led_timing_ok = SystemCoreClock == 24000000U;
-    const bool hall_adc_ready = PINBALL_ENABLE_HALL_ADC && led_timing_ok && configure_hall_adc();
+    hall_adc_ready = PINBALL_ENABLE_HALL_ADC && led_timing_ok && configure_hall_adc();
     if (led_timing_ok) {
         /* Wait for LED power-up before sending the first frame. */
         for (uint32_t cycle = 0; cycle < 240000U; ++cycle) {
             __NOP();
         }
         show_port_colors(0);
-        if (hall_adc_ready) {
+        if (PINBALL_ENABLE_HALL_ADC && hall_adc_ready) {
             scan_hall_inputs();
         }
     }
@@ -462,9 +529,10 @@ int main(void)
         ++heartbeat_count;
         handle_ring_frame(led_timing_ok);
         const uint32_t now = uptime_ms;
+        report_sensor_sample(now);
         if (led_timing_ok && now - last_refresh >= 50U) {
             last_refresh = now;
-            if (hall_adc_ready) {
+            if (PINBALL_ENABLE_HALL_ADC && hall_adc_ready) {
                 scan_hall_inputs();
             }
             if (++refresh_ticks == 20U) {

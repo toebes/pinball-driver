@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.30)
 project(PinballDriver LANGUAGES C ASM)
-option(PINBALL_ENABLE_HALL_ADC "Sample the Hall sensor inputs" ON)
+option(PINBALL_ENABLE_HALL_ADC "Automatically sample Hall sensors for ball detection" ON)
 set(PUYA_SDK_ROOT "C:/Tools/Puya/PY32F002B_Firmware" CACHE PATH "Official PY32F002B firmware library")
 set(template "${PUYA_SDK_ROOT}/Templates/PY32F002Bxx_Templates")
 set(startup "${template}/EIDE/startup_py32f002bxx.s")
@@ -54,7 +54,7 @@ function(configure_py32 target script)
 endfunction()
 
 set(PINBALL_VERSION_MAJOR 0 CACHE STRING "Firmware major version")
-set(PINBALL_VERSION_MINOR 2 CACHE STRING "Firmware minor version")
+set(PINBALL_VERSION_MINOR 4 CACHE STRING "Firmware minor version")
 set(flash_sources firmware/py32/src/update_flash.c
     "${PUYA_SDK_ROOT}/Drivers/PY32F002B_HAL_Driver/Src/py32f002b_hal_flash.c")
 function(enable_flash target)

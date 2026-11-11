@@ -4,7 +4,7 @@ Firmware project for four Puya PY32F002B nodes and an ESP32 coordinator in a pin
 
 ## Project status
 
-The ESP32 touchscreen assigns addresses to the four PY32 nodes and sends RGB commands to the six LED ports on Node 1. The full ring has been verified on hardware, including one-node-at-a-time application updates through the ESP32. All four nodes have been updated to version 0.2. The PY32 also has Hall sampling and baseline detection code. Hall sampling is disabled in the ring bench build pending voltage scaling.
+The ESP32 touchscreen assigns addresses, sends RGB commands to a selected node and port, and displays Hall sensor readings. The full ring and one-node-at-a-time firmware updates have been verified on hardware. Version 0.4 was tested on the bench, where the Hall reading changed when a ball was present. Automatic ball detection sampling is disabled in the ring bench build. On-demand monitoring remains available for inputs within the ADC voltage range.
 
 See the [PY32 build](docs/py32-build.md), [ESP32 build](docs/esp32-build.md), and [ring protocol](shared/protocol/README.md).
 

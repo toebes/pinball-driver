@@ -5,28 +5,27 @@
 #include "py32_update_image.h"
 
 namespace {
-constexpr uint8_t brightness = 25;
-constexpr size_t buttons_per_led = 3;
-struct Preset {
-    const char *label;
-    uint32_t swatch;
-    uint8_t red;
-    uint8_t green;
-    uint8_t blue;
-};
+constexpr size_t history_size = 5;
+lv_obj_t *node_selector;
+lv_obj_t *port_button;
+lv_obj_t *port_label;
+lv_obj_t *sliders[3];
+lv_obj_t *slider_labels[3];
+lv_obj_t *monitor_label;
+lv_obj_t *readings_label;
+lv_obj_t *status_label;
+uint8_t selected_port;
+bool monitoring;
+uint8_t monitor_node;
+uint8_t monitor_port;
+uint8_t readings[history_size];
+size_t reading_count;
 
-const Preset presets[] = {
-    {"Red",     0xC62828, brightness, 0, 0},
-    {"Green",   0x16834A, 0, brightness, 0},
-    {"Blue",    0x2455C3, 0, 0, brightness},
-};
-
-const Preset &preset_for_button(size_t button)
+uint8_t selected_node()
 {
-    return presets[button % buttons_per_led];
+    return static_cast<uint8_t>(lv_dropdown_get_selected(node_selector) + 1U);
 }
 
-lv_obj_t *status_label;
 uint8_t config_rx[RING_MAX_LENGTH + 1];
 size_t config_rx_size;
 uint32_t last_rx_ms;
@@ -44,7 +43,6 @@ void log_ring_tx(const uint8_t *frame, size_t size)
 #if PINBALL_HAS_UPDATE_IMAGE
 enum class UpdateStep { Idle, Start, Data, Apply, BootWait, Address, Verify };
 UpdateStep update_step = UpdateStep::Idle;
-lv_obj_t *update_node_selector;
 uint8_t update_node;
 size_t image_offset;
 size_t chunk_size;
@@ -108,7 +106,11 @@ void start_update(lv_event_t *)
     if (update_step != UpdateStep::Idle) {
         return;
     }
-    update_node = lv_dropdown_get_selected(update_node_selector) + 1;
+    if (monitoring) {
+        lv_label_set_text(status_label, "Stop monitoring before updating");
+        return;
+    }
+    update_node = selected_node();
     image_offset = 0;
     image_crc = firmware_crc32(py32_update_image, sizeof py32_update_image);
     update_step = UpdateStep::Start;
@@ -183,6 +185,10 @@ void start_address_assignment(lv_event_t *)
         return;
     }
 #endif
+    if (monitoring) {
+        lv_label_set_text(status_label, "Stop monitoring before assigning addresses");
+        return;
+    }
     uint8_t frame[RING_ADDRESS_FRAME_SIZE];
     ring_build_address_frame(frame, RING_COORDINATOR, RING_UNASSIGNED,
                              RING_SET_ADDRESS, RING_NODE_1);
@@ -194,25 +200,118 @@ void start_address_assignment(lv_event_t *)
     }
 }
 
-void send_color(lv_event_t *event)
+void select_next_port(lv_event_t *)
+{
+    selected_port = (selected_port + 1U) % RING_LED_COUNT;
+    lv_label_set_text_fmt(port_label, "Port %u", static_cast<unsigned>(selected_port + 1U));
+}
+
+void refresh_slider_label(lv_event_t *event)
+{
+    const size_t channel = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
+    const char *names[] = {"R", "G", "B"};
+    lv_label_set_text_fmt(slider_labels[channel], "%s  %d", names[channel],
+                          static_cast<int>(lv_slider_get_value(sliders[channel])));
+}
+
+void send_color(lv_event_t *)
 {
 #if PINBALL_HAS_UPDATE_IMAGE
     if (update_step != UpdateStep::Idle) {
         return;
     }
 #endif
-    const size_t button = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
-    const Preset &preset = preset_for_button(button);
-    const uint8_t index = button / buttons_per_led;
+    const uint8_t node = selected_node();
+    const uint8_t red = static_cast<uint8_t>(lv_slider_get_value(sliders[0]));
+    const uint8_t green = static_cast<uint8_t>(lv_slider_get_value(sliders[1]));
+    const uint8_t blue = static_cast<uint8_t>(lv_slider_get_value(sliders[2]));
     uint8_t frame[RING_LED_FRAME_SIZE];
-    ring_build_set_led(frame, index, preset.red, preset.green, preset.blue);
+    ring_build_set_led(frame, node, selected_port, red, green, blue);
     if (Serial1.write(frame, sizeof frame) != sizeof frame) {
         lv_label_set_text(status_label, "UART send failed");
         return;
     }
-    lv_label_set_text_fmt(status_label, "Sent LED%u: %s",
-                          static_cast<unsigned>(index + 1), preset.label);
+    lv_label_set_text_fmt(status_label, "Sent to node %u, LED%u: %u, %u, %u",
+                          static_cast<unsigned>(node), static_cast<unsigned>(selected_port + 1U),
+                          static_cast<unsigned>(red), static_cast<unsigned>(green),
+                          static_cast<unsigned>(blue));
     log_ring_tx(frame, sizeof frame);
+}
+
+void toggle_monitor(lv_event_t *)
+{
+#if PINBALL_HAS_UPDATE_IMAGE
+    if (update_step != UpdateStep::Idle) {
+        return;
+    }
+#endif
+    const bool start = !monitoring;
+    const uint8_t node = start ? selected_node() : monitor_node;
+    const uint8_t port = start ? selected_port : monitor_port;
+    uint8_t frame[RING_SENSOR_FRAME_SIZE];
+    ring_build_sensor_frame(frame, RING_COORDINATOR, node, port, start ? 1 : 0);
+    if (Serial1.write(frame, sizeof frame) != sizeof frame) {
+        lv_label_set_text(status_label, "UART send failed");
+        return;
+    }
+
+    log_ring_tx(frame, sizeof frame);
+    monitoring = start;
+    lv_label_set_text(monitor_label, start ? "Stop Monitoring" : "Start Monitoring");
+    if (start) {
+        monitor_node = node;
+        monitor_port = port;
+        reading_count = 0;
+        lv_label_set_text(readings_label, "Waiting for readings...");
+        lv_obj_add_state(node_selector, LV_STATE_DISABLED);
+        lv_obj_add_state(port_button, LV_STATE_DISABLED);
+    } else {
+        lv_obj_clear_state(node_selector, LV_STATE_DISABLED);
+        lv_obj_clear_state(port_button, LV_STATE_DISABLED);
+        if (reading_count == 0) {
+            lv_label_set_text(readings_label, "No readings received");
+        }
+    }
+}
+
+void display_sensor_reading(uint8_t node, uint8_t port, uint8_t value)
+{
+    if (!monitoring || node != monitor_node || port != monitor_port) {
+        return;
+    }
+    if (reading_count < history_size) {
+        ++reading_count;
+    }
+    for (size_t i = reading_count - 1; i > 0; --i) {
+        readings[i] = readings[i - 1];
+    }
+    readings[0] = value;
+
+    char text[64] = {};
+    size_t used = 0;
+    for (size_t i = 0; i < reading_count; ++i) {
+        used += snprintf(text + used, sizeof text - used, "%s%u",
+                         i == 0 ? "" : "\n", static_cast<unsigned>(readings[i]));
+    }
+    lv_label_set_text(readings_label, text);
+    Serial.printf("Node %u Hall port %u: %u\n", static_cast<unsigned>(node),
+                  static_cast<unsigned>(port + 1U), static_cast<unsigned>(value));
+}
+
+lv_obj_t *make_button(lv_obj_t *parent, const char *text, lv_coord_t x, lv_coord_t y,
+                      lv_coord_t width, lv_event_cb_t callback, lv_obj_t **label_out = nullptr)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, width, 42);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+    if (label_out != nullptr) {
+        *label_out = label;
+    }
+    return button;
 }
 }
 
@@ -227,48 +326,58 @@ void led_control_screen_begin()
 #if LV_FONT_MONTSERRAT_24
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
 #endif
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 17);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 21);
 
-    for (size_t i = 0; i < RING_LED_COUNT * buttons_per_led; ++i) {
-        const size_t row = i / buttons_per_led;
-        const size_t column = i % buttons_per_led;
-        const Preset &preset = preset_for_button(i);
-        lv_obj_t *button = lv_btn_create(screen);
-        lv_obj_set_size(button, 208, 51);
-        lv_obj_align(button, LV_ALIGN_TOP_MID, (static_cast<int>(column) - 1) * 232,
-                     58 + static_cast<int>(row) * 60);
-        lv_obj_set_style_bg_color(button, lv_color_hex(preset.swatch), 0);
-        lv_obj_set_style_text_color(button, lv_color_white(), 0);
-        lv_obj_add_event_cb(button, send_color, LV_EVENT_CLICKED, reinterpret_cast<void *>(i));
-
-        lv_obj_t *label = lv_label_create(button);
-        lv_label_set_text_fmt(label, "LED%u  %s", static_cast<unsigned>(row + 1),
-                              preset.label);
-        lv_obj_center(label);
-    }
-
-    lv_obj_t *assign = lv_btn_create(screen);
-    lv_obj_set_size(assign, 178, 36);
-    lv_obj_align(assign, LV_ALIGN_TOP_RIGHT, -64, 10);
-    lv_obj_add_event_cb(assign, start_address_assignment, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *assign_label = lv_label_create(assign);
-    lv_label_set_text(assign_label, "Assign Addresses");
-    lv_obj_center(assign_label);
+    node_selector = lv_dropdown_create(screen);
+    lv_dropdown_set_options(node_selector, "Node 1\nNode 2\nNode 3\nNode 4");
+    lv_obj_set_size(node_selector, 108, 42);
+    lv_obj_set_pos(node_selector, 24, 16);
+    port_button = make_button(screen, "Port 1", 145, 16, 100, select_next_port, &port_label);
+    make_button(screen, "Assign Addresses", 613, 16, 163, start_address_assignment);
 
 #if PINBALL_HAS_UPDATE_IMAGE
-    update_node_selector = lv_dropdown_create(screen);
-    lv_dropdown_set_options(update_node_selector, "Node 1\nNode 2\nNode 3\nNode 4");
-    lv_obj_set_width(update_node_selector, 100);
-    lv_obj_align(update_node_selector, LV_ALIGN_TOP_LEFT, 20, 10);
-    lv_obj_t *update_button = lv_btn_create(screen);
-    lv_obj_set_size(update_button, 106, 36);
-    lv_obj_align(update_button, LV_ALIGN_TOP_LEFT, 130, 10);
-    lv_obj_add_event_cb(update_button, start_update, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *update_label = lv_label_create(update_button);
+    lv_obj_t *update_label;
+    make_button(screen, "", 494, 16, 106, start_update, &update_label);
     lv_label_set_text_fmt(update_label, "Update %u.%u", static_cast<unsigned>(image_major),
                           static_cast<unsigned>(image_minor));
-    lv_obj_center(update_label);
 #endif
+
+    lv_obj_t *led_title = lv_label_create(screen);
+    lv_label_set_text(led_title, "LED Color");
+    lv_obj_set_pos(led_title, 44, 104);
+    const char *labels[] = {"R  0", "G  0", "B  0"};
+    const uint32_t colors[] = {0xC62828, 0x16834A, 0x2455C3};
+    for (size_t i = 0; i < 3; ++i) {
+        const lv_coord_t y = 143 + static_cast<lv_coord_t>(i) * 67;
+        slider_labels[i] = lv_label_create(screen);
+        lv_label_set_text(slider_labels[i], labels[i]);
+        lv_obj_set_pos(slider_labels[i], 44, y);
+        sliders[i] = lv_slider_create(screen);
+        lv_slider_set_range(sliders[i], 0, 255);
+        lv_obj_set_size(sliders[i], 310, 15);
+        lv_obj_set_pos(sliders[i], 47, y + 26);
+        lv_obj_set_style_bg_color(sliders[i], lv_color_hex(colors[i]), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(sliders[i], lv_color_hex(colors[i]), LV_PART_KNOB);
+        lv_obj_add_event_cb(sliders[i], refresh_slider_label, LV_EVENT_VALUE_CHANGED,
+                            reinterpret_cast<void *>(i));
+    }
+    make_button(screen, "Set LED", 44, 351, 132, send_color);
+
+    lv_obj_t *hall_title = lv_label_create(screen);
+    lv_label_set_text(hall_title, "Hall Effect Sensor");
+    lv_obj_set_pos(hall_title, 425, 104);
+    make_button(screen, "Start Monitoring", 425, 142, 192, toggle_monitor, &monitor_label);
+
+    lv_obj_t *history = lv_obj_create(screen);
+    lv_obj_clear_flag(history, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(history, 325, 184);
+    lv_obj_set_pos(history, 425, 199);
+    lv_obj_t *history_title = lv_label_create(history);
+    lv_label_set_text(history_title, "Latest readings (0-255)");
+    lv_obj_align(history_title, LV_ALIGN_TOP_LEFT, 0, 0);
+    readings_label = lv_label_create(history);
+    lv_label_set_text(readings_label, "No readings yet");
+    lv_obj_align(readings_label, LV_ALIGN_TOP_LEFT, 0, 28);
 
     status_label = lv_label_create(screen);
     lv_label_set_text(status_label, "Ready");
@@ -307,6 +416,9 @@ void led_control_screen_poll()
         if (origin != RING_COORDINATOR) {
             if (crc != ring_crc16(config_rx, config_rx_size - 2)) {
                 discard_rx = true;
+            } else if (dest == RING_COORDINATOR && command == RING_MONITOR_SENSOR &&
+                       config_rx_size == RING_SENSOR_FRAME_SIZE) {
+                display_sensor_reading(origin, config_rx[3], config_rx[4]);
             } else if (dest == RING_COORDINATOR && command == RING_DEBUG &&
                        origin <= RING_LAST_UNICAST) {
                 Serial.printf("Node %u debug: ", static_cast<unsigned>(origin));
