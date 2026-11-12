@@ -8,7 +8,8 @@ _Static_assert(FLASH_PAGE_SIZE == RING_FIRMWARE_PAGE_BYTES, "Unexpected flash pa
 static bool writable_page(uint32_t address)
 {
     return (address % FLASH_PAGE_SIZE) == 0U &&
-           address >= UPDATE_APP_BASE && address <= UPDATE_METADATA_BASE;
+           ((address >= UPDATE_APP_BASE && address <= UPDATE_METADATA_BASE) ||
+            address == PORT_SETTINGS_BASE || address == PORT_SETTINGS_BASE + FLASH_PAGE_SIZE);
 }
 
 static bool erase_unlocked(uint32_t address)

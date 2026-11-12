@@ -80,11 +80,11 @@ static inline void ring_build_address_frame(uint8_t *frame, uint8_t source,
     ring_write_crc(frame, RING_ADDRESS_FRAME_SIZE);
 }
 
-static inline void ring_build_set_port_type(uint8_t *frame, uint8_t destination,
-                                            uint8_t index, uint8_t type)
+static inline void ring_build_port_type(uint8_t *frame, uint8_t source,
+                                        uint8_t destination, uint8_t index, uint8_t type)
 {
     frame[0] = RING_PORT_TYPE_FRAME_SIZE - 1;
-    frame[1] = (RING_COORDINATOR << 4) | destination;
+    frame[1] = (uint8_t)((source << 4) | destination);
     frame[2] = (RING_TTL << 4) | RING_SET_PORT_TYPE;
     frame[3] = index;
     frame[4] = type;

@@ -12,7 +12,7 @@ foreach(required IN ITEMS "${startup}" "${linker}" "${system_source}")
   endif()
 endforeach()
 
-# 24 KiB flash: 4 KiB resident, 8 KiB application, 8 KiB staging, 4 KiB metadata.
+# 24 KiB flash: 4 KiB resident, 8 KiB application, 8 KiB staging, 4 KiB for metadata and settings.
 set(app_base 0x08001000)
 set(app_end 0x08003000)
 set(app_vector_offset 0x1000)
@@ -54,7 +54,7 @@ function(configure_py32 target script)
 endfunction()
 
 set(PINBALL_VERSION_MAJOR 0 CACHE STRING "Firmware major version")
-set(PINBALL_VERSION_MINOR 6 CACHE STRING "Firmware minor version")
+set(PINBALL_VERSION_MINOR 8 CACHE STRING "Firmware minor version")
 set(flash_sources firmware/py32/src/update_flash.c
     "${PUYA_SDK_ROOT}/Drivers/PY32F002B_HAL_Driver/Src/py32f002b_hal_flash.c")
 function(enable_flash target)
@@ -72,6 +72,9 @@ target_link_options(py32_bootloader PRIVATE
 
 add_executable(py32_app ${app_sources} "${startup}" "${CMAKE_CURRENT_BINARY_DIR}/system_py32_app.c")
 configure_py32(py32_app "${CMAKE_CURRENT_BINARY_DIR}/py32-app.ld")
+# Keep the application within its 8 KiB slot with automatic Hall sampling enabled.
+target_compile_options(py32_app PRIVATE "$<$<COMPILE_LANGUAGE:C>:-flto>")
+target_link_options(py32_app PRIVATE -flto)
 
 enable_flash(py32_bootloader)
 enable_flash(py32_app)

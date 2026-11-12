@@ -69,6 +69,8 @@ void log_ring_tx(const uint8_t *frame, size_t size)
     Serial.println();
 }
 
+void query_port_type(lv_event_t *);
+
 #if PINBALL_HAS_UPDATE_IMAGE
 enum class UpdateStep { Idle, Start, Data, Apply, BootWait, Address, Verify };
 UpdateStep update_step = UpdateStep::Idle;
@@ -163,8 +165,12 @@ void handle_update_reply(uint8_t origin, uint8_t command, const uint8_t *payload
                 finish_update("Node does not need an update");
             }
         } else if (update_step == UpdateStep::Verify) {
-            finish_update(payload[0] == image_major && payload[1] == image_minor && payload[2] == 0
-                              ? "Update verified" : "Unexpected version after reboot");
+            const bool verified = payload[0] == image_major && payload[1] == image_minor &&
+                                  payload[2] == 0;
+            finish_update(verified ? "Update verified" : "Unexpected version after reboot");
+            if (verified && origin == selected_node()) {
+                query_port_type(nullptr);
+            }
         }
     } else if (update_step == UpdateStep::Data && command == RING_FIRMWARE_DATA &&
                length == 2 && ((static_cast<size_t>(payload[0]) << 8) | payload[1]) == image_offset) {
@@ -233,6 +239,7 @@ void select_next_port(lv_event_t *)
 {
     selected_port = (selected_port + 1U) % RING_LED_COUNT;
     lv_label_set_text_fmt(port_label, "Port %u", static_cast<unsigned>(selected_port + 1U));
+    query_port_type(nullptr);
 }
 
 void refresh_slider_label(lv_event_t *event)
@@ -267,6 +274,29 @@ void send_color(lv_event_t *)
     log_ring_tx(frame, sizeof frame);
 }
 
+bool request_port_type(uint8_t type)
+{
+    uint8_t frame[RING_PORT_TYPE_FRAME_SIZE];
+    ring_build_port_type(frame, RING_COORDINATOR, selected_node(), selected_port, type);
+    if (!send_ring_frame(frame, sizeof frame)) {
+        lv_label_set_text(status_label, "UART send failed");
+        return false;
+    }
+    log_ring_tx(frame, sizeof frame);
+    return true;
+}
+
+void query_port_type(lv_event_t *)
+{
+    lv_dropdown_set_selected(port_type_selector, RING_PORT_UNDEFINED);
+#if PINBALL_HAS_UPDATE_IMAGE
+    if (update_step != UpdateStep::Idle) {
+        return;
+    }
+#endif
+    request_port_type(RING_PORT_UNDEFINED);
+}
+
 void send_port_type(lv_event_t *)
 {
 #if PINBALL_HAS_UPDATE_IMAGE
@@ -274,17 +304,13 @@ void send_port_type(lv_event_t *)
         return;
     }
 #endif
-    const uint8_t node = selected_node();
     const uint8_t type = static_cast<uint8_t>(lv_dropdown_get_selected(port_type_selector));
-    uint8_t frame[RING_PORT_TYPE_FRAME_SIZE];
-    ring_build_set_port_type(frame, node, selected_port, type);
-    if (!send_ring_frame(frame, sizeof frame)) {
-        lv_label_set_text(status_label, "UART send failed");
-        return;
+    if (request_port_type(type)) {
+        lv_label_set_text_fmt(status_label, type == RING_PORT_UNDEFINED
+            ? "Port type requested from node %u, port %u"
+            : "Port type sent to node %u, port %u",
+            static_cast<unsigned>(selected_node()), static_cast<unsigned>(selected_port + 1U));
     }
-    log_ring_tx(frame, sizeof frame);
-    lv_label_set_text_fmt(status_label, "Port type sent to node %u, port %u",
-                          static_cast<unsigned>(node), static_cast<unsigned>(selected_port + 1U));
 }
 
 void toggle_monitor(lv_event_t *)
@@ -409,6 +435,7 @@ void led_control_screen_begin()
     lv_dropdown_set_options(node_selector, "Node 1\nNode 2\nNode 3\nNode 4");
     lv_obj_set_size(node_selector, 108, 42);
     lv_obj_set_pos(node_selector, 24, 16);
+    lv_obj_add_event_cb(node_selector, query_port_type, LV_EVENT_VALUE_CHANGED, nullptr);
     port_button = make_button(screen, "Port 1", 145, 16, 100, select_next_port, &port_label);
     make_button(screen, "Assign Addresses", 613, 16, 163, start_address_assignment);
 
@@ -476,6 +503,7 @@ void led_control_screen_begin()
     status_label = lv_label_create(screen);
     lv_label_set_text(status_label, "Ready");
     lv_obj_align(status_label, LV_ALIGN_BOTTOM_MID, 0, -24);
+    query_port_type(nullptr);
 }
 
 void led_control_screen_poll()
@@ -510,6 +538,11 @@ void led_control_screen_poll()
         if (origin != RING_COORDINATOR) {
             if (crc != ring_crc16(config_rx, config_rx_size - 2)) {
                 discard_rx = true;
+            } else if (dest == RING_COORDINATOR && command == RING_SET_PORT_TYPE &&
+                       config_rx_size == RING_PORT_TYPE_FRAME_SIZE &&
+                       origin == selected_node() && config_rx[3] == selected_port &&
+                       config_rx[4] <= RING_PORT_SERVO_FEEDBACK) {
+                lv_dropdown_set_selected(port_type_selector, config_rx[4]);
             } else if (dest == RING_COORDINATOR && command == RING_MONITOR_SENSOR &&
                        config_rx_size == RING_SENSOR_FRAME_SIZE) {
                 display_sensor_reading(origin, config_rx[3], config_rx[4]);
@@ -523,8 +556,13 @@ void led_control_screen_poll()
 #if PINBALL_HAS_UPDATE_IMAGE
                 if (update_step == UpdateStep::Idle)
 #endif
-                lv_label_set_text_fmt(status_label, "Node %u assigned",
-                                      static_cast<unsigned>(origin));
+                {
+                    lv_label_set_text_fmt(status_label, "Node %u assigned",
+                                          static_cast<unsigned>(origin));
+                    if (origin == selected_node()) {
+                        query_port_type(nullptr);
+                    }
+                }
                 Serial.printf("Node %u config: %02X\n", static_cast<unsigned>(origin),
                               static_cast<unsigned>(config_rx[3]));
             }

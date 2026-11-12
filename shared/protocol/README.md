@@ -47,28 +47,43 @@ The coordinator starts discovery with command 1 (`CMD_SET_ADDRESS`), source 0,
 destination 15, TTL 15, and payload 0x01. The low nibble of the one-byte
 payload is the new address. The upper nibble is reserved and is currently zero.
 
-| 0 | 1 | 2 | 3 | 4 | 5 |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-| 05 | 0F | F1 | 01 | CRC-HI | CRC-LO |
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 05 | Packet Length |
+| 1 | 0F | Source Address=0 Destination=15 |
+| 2 | F1 | TTL=15 Command=1 `CMD_SET_ADDRESS` |
+| 3 | 01 | Top Nibble Reserved New Address=1 |
+| 4 | XX | CRC-HI Byte |
+| 5 | XX | CRC-LO Byte |
 
-An unassigned PY32 consumes `CMD_SET_ADDRESS`, adopts the requested address, and
+An unassigned PY32 (which technically has the address 15 by default) consumes `CMD_SET_ADDRESS`, adopts the requested address, and
 sends these frames in order:
 
-1. `CMD_SET_ADDRESS` to 15 with TTL 15. Preserve the original source and upper
-   payload nibble, and increment the address in the low nibble. Address 13
-   ends assignment to avoid assigning reserved address 14.
+1. `CMD_SET_ADDRESS` to 15 with TTL 15. Preserve the original source
+and upper payload nibble, and increment the address in the low nibble.
+Address 13 ends assignment to avoid assigning reserved address 14.
 
-| 0 | 1 | 2 | 3 | 4 | 5 |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-| 05 | 0F | F1 | 02 | CRC-HI | CRC-LO |
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 05 | Packet Length |
+| 1 | 0F | Source Address=0 Destination=15 |
+| 2 | F1 | TTL=15 Command=1 `CMD_SET_ADDRESS` |
+| 3 | 02 | Top Nibble Reserved New Address=2 |
+| 4 | XX | CRC-HI Byte |
+| 5 | XX | CRC-LO Byte |
 
 2. Command 2 (`CMD_NODE_CONFIG`) from the newly assigned address to the original
    source, with TTL 15 and a one-byte payload. The payload is currently zero
    pending definition.
 
-| 0 | 1 | 2 | 3 | 4 | 5 |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-| 05 | 10 | F2 | 00 | CRC-HI | CRC-LO |
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 05 | Packet Length |
+| 1 | 10 | Source Address=1 Destination=0 |
+| 2 | F2 | TTL=15 Command=2 `CMD_NODE_CONFIG` |
+| 3 | YY | Configuration data (meaning unspecified) |
+| 4 | XX | CRC-HI Byte |
+| 5 | XX | CRC-LO Byte |
 
 An assigned PY32 forwards `CMD_SET_ADDRESS` like any other frame for a different
 destination, decrementing TTL and updating CRC. The coordinator consumes
@@ -79,19 +94,57 @@ PY32s before a fresh enumeration so they all start at 15.
 
 Command 3 carries two payload bytes from the coordinator to an assigned
 node. The first is the port index (0 for Port 1 through 5 for Port 6). The
-second is the port type. The length byte is 6, the complete frame is 7 bytes,
-and the coordinator sends with TTL 5. There is no reply.
+second is the requested port type. Send 0 to query the current setting.
+Values 1 through 4 set the port type. The node replies to either request
+with the port index and its current type. Both frames have a length byte
+of 6, 7 bytes total, and an initial TTL of 5.
+
+Port Type Request
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 06 | Packet Length |
+| 1 | 0N | Source Address=0 Destination=N (target node) |
+| 2 | 53 | TTL=5 Command=3 `CMD_SET_PORT_TYPE` |
+| 3 | 0P | Port Number (0-5) |
+| 4 | TT | 00=Query, 01-04=Set Port Type |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
+
+Port Type Response
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 06 | Packet Length |
+| 1 | N0 | Source Address=N Destination=0 |
+| 2 | 53 | TTL=5 Command=3 `CMD_SET_PORT_TYPE` |
+| 3 | 0P | Port Number (0-5) |
+| 4 | TT | Current Port Type (00-04) |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
 
 | Value | Port type |
 | ---: | --- |
-| 0 | Undefined |
-| 1 | LED output only |
-| 2 | LED with Hall Effect Sensor |
-| 3 | Standard Servo |
-| 4 | Servo with Position feedback |
+| 00 | Undefined |
+| 01 | LED output only |
+| 02 | LED with Hall Effect Sensor |
+| 03 | Standard Servo |
+| 04 | Servo with Position feedback |
 
-Port types start as undefined and are held in RAM until reset. The two
-servo types enable servo position commands. Closed-loop position feedback
+The ESP32 queries the selected node and port on startup, after address
+assignment, and when the selection changes. The dropdown defaults to
+Undefined until a matching response arrives. Selecting Undefined and
+pressing Set Port Type sends a query.
+
+The query requires PY32 firmware 0.8 or newer. Older firmware interprets
+00 as a request to set the port to Undefined.
+
+A node with blank or invalid settings starts with all ports undefined.
+The relocated PY32 application saves changed port types immediately and
+restores them after resets and ring firmware updates. A full chip erase
+clears the saved types. Repeating the current type does not write flash.
+If saving fails, the node replies with the previous type and sends a
+`CMD_DEBUG` message. The two servo types enable servo position commands. Closed-loop position feedback
 is pending. In builds with automatic Hall sampling enabled,
 type 2 enables the Hall-based LED indication until a `CMD_SET_LED_COLOR`
 command overrides it. On-demand `CMD_MONITOR_SENSOR` works independently.
@@ -104,9 +157,13 @@ destination 14, and an initial TTL equal to the number of PY32s in the ring
 (4 on the current board). Each node counts the frame as activity and forwards
 it with the usual TTL and CRC rules. The last node receives it with TTL 1.
 
-| 0 | 1 | 2 | 3 | 4 |
-| :---: | :---: | :---: | :---: | :---: |
-| 04 | 0E | F0 | CRC-HI | CRC-LO |
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 04 | Packet Length |
+| 1 | 0E | Source Address=0 Destination=14 (Multicast) |
+| 2 | F0 | TTL=15 Command=0 `CMD_IDLE` |
+| 3 | XX | CRC-HI Byte |
+| 4 | XX | CRC-LO Byte |
 
 The coordinator waits 1 second after startup or its last non-`CMD_IDLE`
 transmission, then sends `CMD_IDLE` every 500 ms. Any outgoing non-`CMD_IDLE` frame
@@ -127,8 +184,21 @@ Command 4 carries four bytes in order: LED index (0 through 5), red, green,
 and blue. Index 0 is LED1. The length byte is 8 and the total frame is
 9 bytes. The coordinator sends to the selected node address with TTL 5. The target applies
 the RGB values after validating the CRC and leaves that LED under remote
-control until reset. Servo ports ignore `CMD_SET_LED_COLOR`. The target sends a
+control until reset. Servo ports ignore `CMD_SET_LED_COLOR`. The target can send a
 `CMD_DEBUG` message with the RGB values after accepting the command.
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 09 | Packet Length |
+| 1 | 0N | Source Address=0 Destination=N (target node) |
+| 2 | F0 | TTL=15 Command=4 `CMD_SET_LED_COLOR` |
+| 3 | 0P | 0=Unused P=Port Number (0-5) |
+| 4 | RR | Red value for LED |
+| 5 | GG | Green value for LED |
+| 6 | BB | Blue Value for LED |
+| 7 | XX | CRC-HI Byte |
+| 8 | XX | CRC-LO Byte |
+
 
 ## Monitor Sensor (`CMD_MONITOR_SENSOR`)
 
@@ -147,6 +217,30 @@ with rounding. The ESP32 shows the last five readings with the newest first
 and prints received samples to USB serial. The request has no separate ACK.
 An accepted firmware update stops monitoring on its target.
 
+Monitor Request
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 07 | Packet Length |
+| 1 | 0N | Source Address=0 Destination=N (target node) |
+| 2 | F0 | TTL=15 Command=5 `CMD_MONITOR_SENSOR` |
+| 3 | 0P | 0=Unused P=Port Number (0-5) |
+| 4 | SS | Start/Stop for request 1=Start Monitoring, 0=Stop |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
+
+Monitor Response
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 07 | Packet Length |
+| 1 | N0 | Source Address=N Destination=0 |
+| 2 | F5 | TTL=15 Command=5 `CMD_MONITOR_SENSOR` |
+| 3 | 0P | 0=Unused P=Port Number (0-5) |
+| 4 | VV | Scaled value (0-255) read from port |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
+
 ## Set Servo Position (`CMD_SET_SERVO_POSITION`)
 
 Command 6 carries the port index (0 through 5), followed by a signed
@@ -160,19 +254,106 @@ respectively, repeated every 20 ms. The node starts sending pulses after
 the first position command. Changing away from a servo port type clears
 the saved position.
 
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 07 | Packet Length |
+| 1 | N0 | Source Address=N Destination=0 |
+| 2 | F6 | TTL=15 Command=6 `CMD_SET_SERVO_POSITION` |
+| 3 | 0P | 0=Unused P=Port Number (0-5) |
+| 4 | VV | Position to set servo to (signed byte -128-127) |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
+
 ## Firmware update
 
 The ESP32 stores the update image and updates one assigned PY32 at a time.
 Each command is unicast. `CMD_FIRMWARE_START` accepts a version strictly greater than the running major/minor pair. Replies swap source and destination and use the same
 command number. Every frame still carries the ring CRC-16.
 
-| Command | ESP32 request payload | PY32 response payload |
-| --- | --- | --- |
-| 10 `CMD_FIRMWARE_START` | Major, minor, 0 | Current major, current minor, status (0 = no update, 1 = update needed) |
-| 11 `CMD_FIRMWARE_DATA` | Two-byte byte offset, then 1 to 128 image bytes | Same two-byte offset |
-| 12 `CMD_FIRMWARE_APPLY` | Four-byte image CRC-32, then 0 | Calculated image CRC-32, then status (0 = rejected, 1 = accepted) |
+Firmware Start Request
 
-Use byte offsets relative to the start of the application image. Wire
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 07 | Packet Length |
+| 1 | 0N | Source Address=0 Destination=N |
+| 2 | FA | TTL=15 Command=10 `CMD_FIRMWARE_START` |
+| 3 | HH | Major version number |
+| 3 | LL | Minor Version Number |
+| 4 | 00 | 0 |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
+
+Firmware Start Response
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 07 | Packet Length |
+| 1 | N0 | Source Address=N Destination=0 |
+| 2 | FA | TTL=15 Command=10 `CMD_FIRMWARE_START` |
+| 3 | HH | Major version number |
+| 3 | LL | Minor Version Number |
+| 4 | SS | Status: 00=No update, 01=Update needed |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
+
+Firmware Data Request
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | NN | Packet Length |
+| 1 | 0N | Source Address=0 Destination=N |
+| 2 | FB | TTL=15 Command=11 `CMD_FIRMWARE_DATA` |
+| 3 | HH | High Byte of Offset to data |
+| 4 | LL | Low Byte of Offset to data |
+| 5 | DD | First byte of data |
+| ... | DD | Remaining bytes of data |
+| N+6 | XX | CRC-HI Byte |
+| N+6 | XX | CRC-LO Byte |
+
+Firmware Data Response (note that there is no data in the response payload)
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 07 | Packet Length |
+| 1 | N0 | Source Address=N Destination=0 |
+| 2 | FB | TTL=15 Command=11 `CMD_FIRMWARE_DATA` |
+| 3 | HH | High Byte of Offset to data |
+| 4 | LL | Low Byte of Offset to data |
+| 5 | XX | CRC-HI Byte |
+| 6 | XX | CRC-LO Byte |
+
+
+Firmware Apply Request
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 0A | Packet Length |
+| 1 | 0N | Source Address=0 Destination=N |
+| 2 | FC | TTL=15 Command=12 `CMD_FIRMWARE_APPLY` |
+| 3 | IC4 | High byte of image CRC-32 |
+| 4 | IC3 | Second High byte of image CRC-32 |
+| 5 | IC2 | Next to low byte of image CRC-32 |
+| 6 | IC1 | Low byte of image CRC-32 |
+| 7 | 00 | 0 |
+| 8 | XX | CRC-HI Byte |
+| 9 | XX | CRC-LO Byte |
+
+Firmware Apply Response
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | 0A | Packet Length |
+| 1 | N0 | Source Address=N Destination=0 |
+| 2 | FC | TTL=15 Command=12 `CMD_FIRMWARE_APPLY` |
+| 3 | IC4 | High byte of image CRC-32 |
+| 4 | IC3 | Second High byte of image CRC-32 |
+| 5 | IC2 | Next to low byte of image CRC-32 |
+| 6 | IC1 | Low byte of image CRC-32 |
+| 7 | SS | Status 0=rejected, 1=accepted |
+| 8 | XX | CRC-HI Byte |
+| 9 | XX | CRC-LO Byte |
+
+Byte offsets are relative to the start of the application image. Wire
 order for offsets and CRC-32 is most significant byte first. Start at offset
 0 and send contiguous chunks, using 128 bytes except for a possible short
 final chunk. The ESP32 waits for the matching offset ACK before sending the
@@ -184,7 +365,7 @@ The image check is CRC-32/ISO-HDLC over the exact image bytes, excluding
 any flash-page padding. The check value for ASCII '123456789' is 0xCBF43926.
 Use the end of the last accepted contiguous chunk as the image length.
 A successful `CMD_FIRMWARE_APPLY` reply means the image passed its CRC and is accepted for
-activation. Wait for UART transmission complete before activating or resetting.
+activation. The system waits for UART transmission complete before activating or resetting in order to ensure that the response is sent.
 
 After reboot, the updated PY32 is at address 15. The ESP32 sends `CMD_SET_ADDRESS`
 (command 1) to 15 with the updated node's previous address and waits for that
@@ -205,5 +386,16 @@ Command 13 carries up to 130 bytes of debug text with destination 0. Send
 plain ASCII or UTF-8 bytes without a terminating NUL. The frame length gives
 the text length. Forwarders apply the usual TTL and CRC rules. The ESP32
 writes the text to USB serial with a `Node <address> debug:` prefix. `CMD_DEBUG`
-has no reply. The PY32 application emits an acknowledgement text such as
+has no reply. For example, The PY32 application emits an acknowledgement text such as
 `LED 1 RGB: 25, 0, 0` after applying a `CMD_SET_LED_COLOR` command.
+
+
+| Byte | Value | Usage |
+| :---: | :---: | --- |
+| 0 | NN | Packet Length |
+| 1 | N0 | Source Address=N Destination=0 |
+| 2 | FD | TTL=15 Command=13 `CMD_DEBUG` |
+| 3 | ZZ | First byte of data |
+| ... | ZZ | Remaining bytes of data |
+| N+3 | XX | CRC-HI Byte |
+| N+4 | XX | CRC-LO Byte |

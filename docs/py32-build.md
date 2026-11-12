@@ -43,7 +43,12 @@ bench build produces `py32_bootloader.elf` and `py32_app.elf`.
 | Resident bootloader | 0x08000000 | 4 KiB |
 | Application | 0x08001000 | 8 KiB |
 | Staging | 0x08003000 | 8 KiB |
-| Update metadata | 0x08005000 | 4 KiB |
+| Update metadata | 0x08005000 | 128 bytes |
+| Port settings | 0x08005100 | Two 128-byte pages |
+
+The relocated application saves all six port types when one changes, alternating
+between the two pages. At boot it selects the newest valid record. Ring
+updates preserve both pages. A full chip erase clears them.
 
 With the ST-LINK attached, program and verify both ELFs at their linked
 addresses, then reset and run. The bootloader checks the application's initial
@@ -54,7 +59,7 @@ Use the standalone `py32_smoke.elf` only on a board where you intend to
 replace the resident bootloader. It is linked at the flash base. For an
 installed bootloader, load application symbols from `py32_app.elf`.
 
-Firmware commands 10 through 12 stage and verify an application image, then request activation by the resident bootloader. The default application version is 0.6. Pass `-DPINBALL_VERSION_MINOR=6` when reconfiguring a build directory with an older cached version. Set `-DPINBALL_VERSION_MINOR=0` in a separate bench build to create an older test target.
+Firmware commands 10 through 12 stage and verify an application image, then request activation by the resident bootloader. The default application version is 0.8. Pass `-DPINBALL_VERSION_MINOR=8` when reconfiguring a build directory with an older cached version. Set `-DPINBALL_VERSION_MINOR=0` in a separate bench build to create an older test target.
 
 Application diagnostics can travel as DEBUG packets to the ESP32 USB serial
 log. Only one OpenOCD session can use the ST-LINK at a time.

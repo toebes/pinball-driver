@@ -449,6 +449,92 @@ static bool write_update_page(uint32_t address, const void *data, size_t length)
     return written;
 }
 
+/* The magic identifies version 1 of the on-flash record format. */
+#define PORT_SETTINGS_MAGIC 0x50545331U
+
+typedef struct {
+    uint32_t magic;
+    uint32_t sequence;
+    uint8_t types[RING_LED_COUNT];
+    uint8_t reserved[2];
+    uint32_t crc;
+} port_settings_t;
+
+_Static_assert(sizeof(port_settings_t) == 20U, "Unexpected port settings record layout");
+_Static_assert(PORT_SETTINGS_BASE % RING_FIRMWARE_PAGE_BYTES == 0U &&
+               PORT_SETTINGS_BASE >= UPDATE_METADATA_BASE + RING_FIRMWARE_PAGE_BYTES &&
+               PORT_SETTINGS_BASE + 2U * RING_FIRMWARE_PAGE_BYTES <= 0x08006000U,
+               "Port settings must occupy two pages beyond update metadata");
+
+static uint32_t port_settings_sequence;
+static uint32_t port_settings_next_page = PORT_SETTINGS_BASE;
+
+static uint32_t port_settings_crc(const port_settings_t *settings)
+{
+    return firmware_crc32((const uint8_t *)settings, offsetof(port_settings_t, crc));
+}
+
+static bool port_settings_valid(const port_settings_t *settings)
+{
+    if (settings->magic != PORT_SETTINGS_MAGIC || settings->crc != port_settings_crc(settings)) {
+        return false;
+    }
+    for (size_t i = 0; i < RING_LED_COUNT; ++i) {
+        if (settings->types[i] > RING_PORT_SERVO_FEEDBACK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void restore_port_settings(void)
+{
+    const uint32_t second_page = PORT_SETTINGS_BASE + RING_FIRMWARE_PAGE_BYTES;
+    const port_settings_t *first = (const port_settings_t *)PORT_SETTINGS_BASE;
+    const port_settings_t *second = (const port_settings_t *)second_page;
+    const port_settings_t *latest = port_settings_valid(first) ? first : NULL;
+
+    /* Unsigned subtraction also orders adjacent records across sequence wrap. */
+    if (port_settings_valid(second) &&
+        (latest == NULL || second->sequence - latest->sequence < UINT32_MAX / 2U)) {
+        latest = second;
+    }
+    if (latest != NULL) {
+        for (size_t i = 0; i < RING_LED_COUNT; ++i) {
+            port_types[i] = latest->types[i];
+        }
+        port_settings_sequence = latest->sequence;
+        port_settings_next_page = latest == first ? second_page : PORT_SETTINGS_BASE;
+    }
+}
+
+static bool save_port_type(uint8_t port, uint8_t type)
+{
+    port_settings_t settings = { .magic = PORT_SETTINGS_MAGIC,
+                                 .sequence = port_settings_sequence + 1U };
+    for (size_t i = 0; i < RING_LED_COUNT; ++i) {
+        settings.types[i] = port_types[i];
+    }
+    settings.types[port] = type;
+    settings.crc = port_settings_crc(&settings);
+
+    if (!write_update_page(port_settings_next_page, &settings, sizeof settings)) {
+        static const char message[] = "Port type save failed";
+        uint8_t frame[3 + sizeof message - 1 + 2] = {
+            sizeof frame - 1U, (uint8_t)(node_address << 4), (RING_TTL << 4) | RING_DEBUG
+        };
+        memcpy(frame + 3, message, sizeof message - 1U);
+        ring_write_crc(frame, sizeof frame);
+        send_ring_frame(frame, sizeof frame);
+        return false;
+    }
+
+    port_settings_sequence = settings.sequence;
+    port_settings_next_page = port_settings_next_page == PORT_SETTINGS_BASE
+        ? PORT_SETTINGS_BASE + RING_FIRMWARE_PAGE_BYTES : PORT_SETTINGS_BASE;
+    return true;
+}
+
 uint32_t HAL_GetTick(void)
 {
     return uptime_ms;
@@ -546,11 +632,21 @@ static void handle_ring_frame(bool led_timing_ok)
                        command == RING_SET_PORT_TYPE && count == RING_PORT_TYPE_FRAME_SIZE &&
                        frame[3] < RING_LED_COUNT && frame[4] <= RING_PORT_SERVO_FEEDBACK) {
                 const uint8_t port = frame[3];
-                if (port_is_servo(port) && frame[4] < RING_PORT_SERVO) {
-                    servo_pulse_us[port] = 0U;
-                    displayed_colors[port] = UINT32_MAX;
+                const uint8_t type = frame[4];
+                if (type != RING_PORT_UNDEFINED && port_types[port] != type
+#if PINBALL_UPDATE_ENABLED
+                    && save_port_type(port, type)
+#endif
+                ) {
+                    if (port_is_servo(port) && type < RING_PORT_SERVO) {
+                        servo_pulse_us[port] = 0U;
+                        displayed_colors[port] = UINT32_MAX;
+                    }
+                    port_types[port] = type;
                 }
-                port_types[port] = frame[4];
+                uint8_t reply[RING_PORT_TYPE_FRAME_SIZE];
+                ring_build_port_type(reply, node_address, origin, port, port_types[port]);
+                send_ring_frame(reply, sizeof reply);
             } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR &&
                        command == RING_SET_SERVO_POSITION &&
                        count == RING_SERVO_POSITION_FRAME_SIZE &&
@@ -597,6 +693,9 @@ static void handle_ring_frame(bool led_timing_ok)
 
 int main(void)
 {
+#if PINBALL_UPDATE_ENABLED
+    restore_port_settings();
+#endif
     configure_node1_ports();
     SystemCoreClockUpdate();
     configure_ring_uart();
