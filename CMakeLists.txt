@@ -54,7 +54,7 @@ function(configure_py32 target script)
 endfunction()
 
 set(PINBALL_VERSION_MAJOR 0 CACHE STRING "Firmware major version")
-set(PINBALL_VERSION_MINOR 5 CACHE STRING "Firmware minor version")
+set(PINBALL_VERSION_MINOR 6 CACHE STRING "Firmware minor version")
 set(flash_sources firmware/py32/src/update_flash.c
     "${PUYA_SDK_ROOT}/Drivers/PY32F002B_HAL_Driver/Src/py32f002b_hal_flash.c")
 function(enable_flash target)

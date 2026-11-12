@@ -24,6 +24,8 @@ enum {
     RING_MONITOR_SENSOR = 5,
     RING_SENSOR_FRAME_SIZE = 7,
     RING_SENSOR_PERIOD_MS = 250,
+    RING_SET_SERVO_POSITION = 6,
+    RING_SERVO_POSITION_FRAME_SIZE = 7,
     RING_DEBUG = 13,
     RING_LED_COUNT = 6,
     RING_MIN_LENGTH = 4,
@@ -112,6 +114,17 @@ static inline void ring_build_sensor_frame(uint8_t *frame, uint8_t origin,
     frame[3] = index;
     frame[4] = value;
     ring_write_crc(frame, RING_SENSOR_FRAME_SIZE);
+}
+
+static inline void ring_build_servo_position(uint8_t *frame, uint8_t destination,
+                                             uint8_t index, int8_t position)
+{
+    frame[0] = RING_SERVO_POSITION_FRAME_SIZE - 1;
+    frame[1] = (RING_COORDINATOR << 4) | destination;
+    frame[2] = (RING_TTL << 4) | RING_SET_SERVO_POSITION;
+    frame[3] = index;
+    frame[4] = (uint8_t)position;
+    ring_write_crc(frame, RING_SERVO_POSITION_FRAME_SIZE);
 }
 
 #endif

@@ -17,6 +17,8 @@ lv_obj_t *sliders[3];
 lv_obj_t *slider_labels[3];
 lv_obj_t *monitor_label;
 lv_obj_t *port_type_selector;
+lv_obj_t *servo_slider;
+lv_obj_t *servo_label;
 lv_obj_t *readings_label;
 lv_obj_t *status_label;
 uint8_t selected_port;
@@ -321,6 +323,33 @@ void toggle_monitor(lv_event_t *)
     }
 }
 
+void refresh_servo_label(lv_event_t *)
+{
+    lv_label_set_text_fmt(servo_label, "Servo %d",
+                          static_cast<int>(lv_slider_get_value(servo_slider)));
+}
+
+void send_servo_position(lv_event_t *)
+{
+#if PINBALL_HAS_UPDATE_IMAGE
+    if (update_step != UpdateStep::Idle) {
+        return;
+    }
+#endif
+    const uint8_t node = selected_node();
+    const auto position = static_cast<int8_t>(lv_slider_get_value(servo_slider));
+    uint8_t frame[RING_SERVO_POSITION_FRAME_SIZE];
+    ring_build_servo_position(frame, node, selected_port, position);
+    if (!send_ring_frame(frame, sizeof frame)) {
+        lv_label_set_text(status_label, "UART send failed");
+        return;
+    }
+    log_ring_tx(frame, sizeof frame);
+    lv_label_set_text_fmt(status_label, "Servo position %d sent to node %u, port %u",
+                          static_cast<int>(position), static_cast<unsigned>(node),
+                          static_cast<unsigned>(selected_port + 1U));
+}
+
 void display_sensor_reading(uint8_t node, uint8_t port, uint8_t value)
 {
     if (!monitoring || node != monitor_node || port != monitor_port) {
@@ -433,6 +462,16 @@ void led_control_screen_begin()
     readings_label = lv_label_create(history);
     lv_label_set_text(readings_label, "No readings yet");
     lv_obj_align(readings_label, LV_ALIGN_TOP_LEFT, 0, 28);
+
+    servo_label = lv_label_create(screen);
+    lv_obj_set_pos(servo_label, 44, 405);
+    servo_slider = lv_slider_create(screen);
+    lv_slider_set_range(servo_slider, -128, 127);
+    lv_obj_set_size(servo_slider, 215, 15);
+    lv_obj_set_pos(servo_slider, 153, 406);
+    lv_obj_add_event_cb(servo_slider, refresh_servo_label, LV_EVENT_VALUE_CHANGED, nullptr);
+    refresh_servo_label(nullptr);
+    make_button(screen, "Set Servo", 425, 392, 140, send_servo_position);
 
     status_label = lv_label_create(screen);
     lv_label_set_text(status_label, "Ready");

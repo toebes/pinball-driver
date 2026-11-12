@@ -4,6 +4,7 @@
 #include "py32f002b_ll_bus.h"
 #include "py32f002b_ll_gpio.h"
 #include "py32f002b_ll_rcc.h"
+#include "py32f002b_ll_tim.h"
 #include "py32f002b_ll_usart.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,6 +21,7 @@ extern void sk6812_send_frame(volatile uint32_t *bsrr, uint32_t set_mask,
 volatile uint32_t heartbeat_count;
 enum { HALL_PORT_COUNT = 6, HALL_BASELINE_SAMPLES = 8 };
 enum { PORT_IDLE_TIMEOUT_MS = 1000, PORT_IDLE_STEP_MS = 500 };
+enum { SERVO_FRAME_US = 20000, SERVO_CENTER_US = 1500, SERVO_SPAN_US = 500 };
 volatile uint16_t hall_adc_raw[HALL_PORT_COUNT];
 volatile uint16_t hall_baseline[HALL_PORT_COUNT];
 volatile bool hall_baseline_ready[HALL_PORT_COUNT];
@@ -40,11 +42,14 @@ static const struct {
     { GPIOA, LL_GPIO_PIN_4, LL_ADC_CHANNEL_2 },
 };
 static bool led_overridden[RING_LED_COUNT];
-static uint8_t port_types[RING_LED_COUNT];
+static volatile uint8_t port_types[RING_LED_COUNT];
+static volatile uint16_t servo_pulse_us[RING_LED_COUNT];
+static volatile uint8_t servo_high_port = RING_LED_COUNT;
+static volatile bool servo_paused;
 static uint32_t port_colors[RING_LED_COUNT];
 static uint32_t displayed_colors[RING_LED_COUNT];
 static uint32_t last_message_ms;
-static bool ports_idle;
+static volatile bool ports_idle;
 static bool hall_adc_ready;
 static bool sensor_monitoring;
 static uint8_t monitored_port;
@@ -110,6 +115,53 @@ static const struct {
     { GPIOB, LL_GPIO_PIN_3 },
 };
 
+static bool port_is_servo(size_t port)
+{
+    return port_types[port] >= RING_PORT_SERVO;
+}
+
+void TIM14_IRQHandler(void)
+{
+    const bool new_frame = LL_TIM_IsActiveFlag_UPDATE(TIM14);
+    const uint8_t previous = servo_high_port;
+    if (previous < RING_LED_COUNT) {
+        LL_GPIO_ResetOutputPin(leds[previous].port, leds[previous].pin);
+    }
+    servo_high_port = RING_LED_COUNT;
+    LL_TIM_ClearFlag_UPDATE(TIM14);
+    LL_TIM_ClearFlag_CC1(TIM14);
+
+    /* Send one pulse at a time. Six maximum-width pulses fit in 20 ms. */
+    if (!ports_idle && !servo_paused) {
+        for (unsigned port = new_frame ? 0U : previous + 1U; port < RING_LED_COUNT; ++port) {
+            const uint16_t width = servo_pulse_us[port];
+            if (port_is_servo(port) && width != 0U) {
+                servo_high_port = port;
+                LL_GPIO_SetOutputPin(leds[port].port, leds[port].pin);
+                LL_TIM_OC_SetCompareCH1(TIM14, LL_TIM_GetCounter(TIM14) + width);
+                LL_TIM_EnableIT_CC1(TIM14);
+                return;
+            }
+        }
+    }
+    LL_TIM_DisableIT_CC1(TIM14);
+}
+
+static void configure_servo_timer(void)
+{
+    const uint32_t apb_prescaler = LL_RCC_GetAPB1Prescaler();
+    const uint32_t pclk = __LL_RCC_CALC_PCLK1_FREQ(SystemCoreClock, apb_prescaler);
+    const uint32_t timer_clock = apb_prescaler == LL_RCC_APB1_DIV_1 ? pclk : pclk * 2U;
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM14);
+    LL_TIM_SetPrescaler(TIM14, timer_clock / 1000000U - 1U);
+    LL_TIM_SetAutoReload(TIM14, SERVO_FRAME_US - 1U);
+    LL_TIM_GenerateEvent_UPDATE(TIM14);
+    LL_TIM_ClearFlag_UPDATE(TIM14);
+    LL_TIM_EnableIT_UPDATE(TIM14);
+    NVIC_EnableIRQ(TIM14_IRQn);
+    LL_TIM_EnableCounter(TIM14);
+}
+
 static void configure_node1_ports(void)
 {
     LL_IOP_GRP1_EnableClock(LL_IOP_GRP1_PERIPH_GPIOA | LL_IOP_GRP1_PERIPH_GPIOB);
@@ -150,7 +202,7 @@ static bool configure_hall_adc(void)
     return false;
 }
 
-static void show_led_color(size_t port, uint32_t grb)
+static bool show_led_color(size_t port, uint32_t grb)
 {
     const uint32_t reset_mask = leds[port].pin << 16;
     uint32_t early_reset[24];
@@ -160,8 +212,13 @@ static void show_led_color(size_t port, uint32_t grb)
 
     const uint32_t interrupt_mask = __get_PRIMASK();
     __disable_irq();
+    if (servo_high_port < RING_LED_COUNT) {
+        __set_PRIMASK(interrupt_mask);
+        return false;
+    }
     sk6812_send_frame(&leds[port].port->BSRR, leds[port].pin, reset_mask, early_reset);
     __set_PRIMASK(interrupt_mask);
+    return true;
 }
 
 static void track_hall_sample(size_t port, uint16_t sample)
@@ -234,19 +291,15 @@ static void scan_hall_inputs(void)
     }
 }
 
-static bool port_is_servo(size_t port)
-{
-    return port_types[port] >= RING_PORT_SERVO;
-}
-
 static void refresh_port_colors(size_t idle_color_index)
 {
     static const uint32_t idle_colors[] = {0x001000U, 0x100000U, 0x000010U};
     for (size_t port = 0; port < RING_LED_COUNT; ++port) {
-        const uint32_t color = ports_idle ? idle_colors[idle_color_index] :
-                               port_is_servo(port) ? 0U : port_colors[port];
-        if (displayed_colors[port] != color) {
-            show_led_color(port, color);
+        if (!ports_idle && port_is_servo(port)) {
+            continue;
+        }
+        const uint32_t color = ports_idle ? idle_colors[idle_color_index] : port_colors[port];
+        if (displayed_colors[port] != color && show_led_color(port, color)) {
             displayed_colors[port] = color;
         }
     }
@@ -386,6 +439,16 @@ _Static_assert(PINBALL_VERSION_MAJOR >= 0 && PINBALL_VERSION_MAJOR <= 255 &&
 static bool update_active;
 static uint16_t update_size;
 
+static bool write_update_page(uint32_t address, const void *data, size_t length)
+{
+    servo_paused = true;
+    while (servo_high_port < RING_LED_COUNT) {
+    }
+    const bool written = update_write_page(address, data, length);
+    servo_paused = false;
+    return written;
+}
+
 uint32_t HAL_GetTick(void)
 {
     return uptime_ms;
@@ -428,7 +491,7 @@ static void handle_firmware_command(uint8_t command, const uint8_t *payload, siz
         if (offset + bytes <= update_size &&
             memcmp((const void *)address, payload + 2, bytes) == 0) {
             send_update_reply(command, payload, 2);
-        } else if (offset == update_size && update_write_page(address, payload + 2, bytes)) {
+        } else if (offset == update_size && write_update_page(address, payload + 2, bytes)) {
             update_size += (uint16_t)bytes;
             send_update_reply(command, payload, 2);
         }
@@ -441,7 +504,7 @@ static void handle_firmware_command(uint8_t command, const uint8_t *payload, siz
             update_record_t record = {UPDATE_PENDING_MAGIC, update_size, crc, 0};
             record.record_crc = firmware_crc32((const uint8_t *)&record,
                                                 offsetof(update_record_t, record_crc));
-            accepted = update_write_page(UPDATE_METADATA_BASE, &record, sizeof record);
+            accepted = write_update_page(UPDATE_METADATA_BASE, &record, sizeof record);
         }
         uint8_t reply[5];
         firmware_write_be32(reply, crc);
@@ -482,7 +545,19 @@ static void handle_ring_frame(bool led_timing_ok)
             } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR &&
                        command == RING_SET_PORT_TYPE && count == RING_PORT_TYPE_FRAME_SIZE &&
                        frame[3] < RING_LED_COUNT && frame[4] <= RING_PORT_SERVO_FEEDBACK) {
-                port_types[frame[3]] = frame[4];
+                const uint8_t port = frame[3];
+                if (port_is_servo(port) && frame[4] < RING_PORT_SERVO) {
+                    servo_pulse_us[port] = 0U;
+                    displayed_colors[port] = UINT32_MAX;
+                }
+                port_types[port] = frame[4];
+            } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR &&
+                       command == RING_SET_SERVO_POSITION &&
+                       count == RING_SERVO_POSITION_FRAME_SIZE &&
+                       frame[3] < RING_LED_COUNT && port_is_servo(frame[3])) {
+                const int position = frame[4] < 128U ? frame[4] : (int)frame[4] - 256;
+                servo_pulse_us[frame[3]] = SERVO_CENTER_US +
+                    position * SERVO_SPAN_US / (position < 0 ? 128 : 127);
             } else if (node_address != RING_UNASSIGNED && led_timing_ok &&
                        command == RING_SET_LED && count == RING_LED_FRAME_SIZE &&
                        frame[3] < RING_LED_COUNT && !port_is_servo(frame[3])) {
@@ -525,6 +600,7 @@ int main(void)
     configure_node1_ports();
     SystemCoreClockUpdate();
     configure_ring_uart();
+    configure_servo_timer();
     const bool led_timing_ok = SystemCoreClock == 24000000U;
     hall_adc_ready = PINBALL_ENABLE_HALL_ADC && led_timing_ok && configure_hall_adc();
     if (led_timing_ok) {

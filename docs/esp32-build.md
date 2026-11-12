@@ -21,6 +21,8 @@ After resetting the PY32s, tap **Assign Addresses** once. Select a node and use 
 Choose a type from the port type dropdown and tap **Set Port Type** to send it
 to the selected node and port. The dropdown selects what to send. A node
 enters its RGB idle cycle after a second without incoming ring frames.
+For a servo, set the port type first, choose a signed position with the
+Servo slider, and tap **Set Servo**. Position 0 sends the neutral pulse.
 
 For ring updates, build the relocated `py32_app` target and supply its build
 directory to `prepare-esp32-demo.ps1 -Py32Build`. The script embeds the binary

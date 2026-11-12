@@ -57,8 +57,8 @@ and the coordinator sends with TTL 5. There is no reply.
 | 4 | Servo with Position feedback |
 
 Port types start as undefined and are held in RAM until reset. The two
-servo types reserve the port for servo control. PWM and position feedback
-control are pending. In builds with automatic Hall sampling enabled,
+servo types enable servo position commands. Closed-loop position feedback
+is pending. In builds with automatic Hall sampling enabled,
 type 2 enables the Hall-based LED indication until a Set LED color
 command overrides it. On-demand Monitor_Sensor works independently.
 
@@ -80,6 +80,8 @@ six ports at brightness 16 out of 256, changing every 500 ms. Frames
 addressed elsewhere also count as activity. The next valid frame restores
 normal output using the colors and port types retained during the timeout,
 with any changes made by that frame.
+Servo pulses pause during the idle LED cycle and resume at the last
+commanded position when traffic returns.
 
 ## Set LED color
 
@@ -108,6 +110,19 @@ with rounding. The ESP32 shows the last five readings with the newest first
 and prints received samples to USB serial. The request has no separate ACK.
 An accepted firmware update stops monitoring on its target.
 
+## Set_Servo_Position
+
+Command 6 carries the port index (0 through 5), followed by a signed
+two's-complement position byte (-128 through 127). The length byte is 6
+and the complete frame is 7 bytes. The ESP32 sends it to an assigned
+node with TTL 5. The command has no reply and only port types 3 and 4
+accept it.
+
+Positions -128, 0, and 127 map to 1.0 ms, 1.5 ms, and 2.0 ms high pulses
+respectively, repeated every 20 ms. The node starts sending pulses after
+the first position command. Changing away from a servo port type clears
+the saved position.
+
 ## Command registry
 
 | Value (decimal) | Command | Status |
@@ -115,9 +130,10 @@ An accepted firmware update stops monitoring on its target.
 | 0 | IDLE | Implemented |
 | 1 | Set Address | Implemented |
 | 2 | Node_Config | Implemented. Payload definition pending. |
-| 3 | Set Port Type | Implemented. Servo control pending. |
+| 3 | Set Port Type | Implemented |
 | 4 | Set LED color | Implemented |
 | 5 | Monitor_Sensor | Implemented |
+| 6 | Set_Servo_Position | Implemented. Position feedback pending. |
 | 10 | Firmware Start | Implemented |
 | 11 | Firmware Data | Implemented |
 | 12 | Firmware Apply | Implemented |
