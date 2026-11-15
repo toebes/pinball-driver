@@ -28,6 +28,11 @@ For ring updates, build the relocated `py32_app` target and supply its build
 directory to `prepare-esp32-demo.ps1 -Py32Build`. The script embeds the binary
 and reads its major/minor version from the CMake cache. Omitting `-Py32Build`
 builds the coordinator without an update image. Assign all four addresses
-before updating, select the target node, and tap the **Update** button showing
-the embedded version. The coordinator
-confirms the version after reboot and address reassignment.
+before updating and tap the **Update** button showing the embedded version.
+All four nodes must accept the version and validate the staged image before
+the coordinator sends the install command. It reassigns all four addresses
+and checks each firmware version after reboot.
+
+For the initial V0.9 rollout, provision every V0.8 node using SWD or build the
+coordinator from tag `0.8` with the V0.9 PY32 image for a one-node-at-a-time
+unicast update. Subsequent upgrades can use multicast once all nodes support it.

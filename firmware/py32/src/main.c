@@ -438,6 +438,8 @@ _Static_assert(PINBALL_VERSION_MAJOR >= 0 && PINBALL_VERSION_MAJOR <= 255 &&
 
 static bool update_active;
 static uint16_t update_size;
+static bool update_validated;
+static uint32_t update_validated_crc;
 
 static bool write_update_page(uint32_t address, const void *data, size_t length)
 {
@@ -552,53 +554,63 @@ static void send_update_reply(uint8_t command, const uint8_t *payload, size_t le
     send_ring_frame(reply, count);
 }
 
-static void handle_firmware_command(uint8_t command, const uint8_t *payload, size_t length)
+static void start_firmware_update(const uint8_t *payload)
 {
-    if (command == RING_FIRMWARE_START && length == 3 && payload[2] == 0U) {
-        const uint16_t requested = ((uint16_t)payload[0] << 8) | payload[1];
-        const uint16_t current = (PINBALL_VERSION_MAJOR << 8) | PINBALL_VERSION_MINOR;
-        update_active = requested > current;
-        update_size = 0;
-        if (update_active) {
-            sensor_monitoring = false;
-        }
-        const uint8_t reply[] = {PINBALL_VERSION_MAJOR, PINBALL_VERSION_MINOR, update_active};
-        send_update_reply(command, reply, sizeof reply);
-    } else if (command == RING_FIRMWARE_DATA && update_active &&
-               length >= 3U && length <= 2U + RING_FIRMWARE_PAGE_BYTES) {
-        const uint16_t offset = ((uint16_t)payload[0] << 8) | payload[1];
-        const size_t bytes = length - 2U;
-        if ((offset % RING_FIRMWARE_PAGE_BYTES) != 0U ||
-            offset + bytes > RING_FIRMWARE_SLOT_BYTES) {
-            return;
-        }
+    const uint16_t requested = ((uint16_t)payload[0] << 8) | payload[1];
+    const uint16_t current = (PINBALL_VERSION_MAJOR << 8) | PINBALL_VERSION_MINOR;
+    update_active = requested > current;
+    update_size = 0;
+    update_validated = false;
+    if (update_active) {
+        sensor_monitoring = false;
+    }
+    const uint8_t reply[] = {PINBALL_VERSION_MAJOR, PINBALL_VERSION_MINOR, update_active};
+    send_update_reply(RING_FIRMWARE_START, reply, sizeof reply);
+}
 
-        const uint32_t address = UPDATE_STAGE_BASE + offset;
-        if (offset + bytes <= update_size &&
-            memcmp((const void *)address, payload + 2, bytes) == 0) {
-            send_update_reply(command, payload, 2);
-        } else if (offset == update_size && write_update_page(address, payload + 2, bytes)) {
-            update_size += (uint16_t)bytes;
-            send_update_reply(command, payload, 2);
-        }
-    } else if (command == RING_FIRMWARE_APPLY && update_active &&
-               length == 5U && payload[4] == 0U) {
+static void stage_firmware_page(const uint8_t *payload, size_t length)
+{
+    update_validated = false;
+    if (!update_active) {
+        return;
+    }
+    update_active = false;
+    if (length < 3U || length > 2U + RING_FIRMWARE_PAGE_BYTES) {
+        return;
+    }
+    const uint16_t offset = ((uint16_t)payload[0] << 8) | payload[1];
+    const size_t bytes = length - 2U;
+    if (offset == update_size && offset % RING_FIRMWARE_PAGE_BYTES == 0U &&
+        offset + bytes <= RING_FIRMWARE_SLOT_BYTES &&
+        write_update_page(UPDATE_STAGE_BASE + offset, payload + 2, bytes)) {
+        update_size += (uint16_t)bytes;
+        update_active = true;
+    }
+}
+
+static void apply_firmware_update(const uint8_t *payload)
+{
+    const uint32_t requested_crc = firmware_read_be32(payload);
+    const uint8_t mode = payload[4];
+    if (mode == RING_FIRMWARE_CHECK_VALID) {
         const uint32_t crc = firmware_crc32((const uint8_t *)UPDATE_STAGE_BASE, update_size);
-        bool accepted = false;
-        if (crc == firmware_read_be32(payload) &&
-            update_vectors_valid(UPDATE_STAGE_BASE, update_size)) {
-            update_record_t record = {UPDATE_PENDING_MAGIC, update_size, crc, 0};
-            record.record_crc = firmware_crc32((const uint8_t *)&record,
-                                                offsetof(update_record_t, record_crc));
-            accepted = write_update_page(UPDATE_METADATA_BASE, &record, sizeof record);
-        }
+        update_validated = update_active && crc == requested_crc &&
+                           update_vectors_valid(UPDATE_STAGE_BASE, update_size);
+        update_validated_crc = crc;
         uint8_t reply[5];
         firmware_write_be32(reply, crc);
-        reply[4] = accepted;
-        send_update_reply(command, reply, sizeof reply);
-        if (accepted) {
-            while (!LL_USART_IsActiveFlag_TC(USART1)) {
-            }
+        reply[4] = update_validated;
+        send_update_reply(RING_FIRMWARE_APPLY, reply, sizeof reply);
+    } else if (mode == RING_FIRMWARE_COMMIT && update_validated &&
+               requested_crc == update_validated_crc) {
+        update_validated = false;
+        /* The final frame is queued. Wait for its last stop bit before writing flash. */
+        while (!LL_USART_IsActiveFlag_TC(USART1)) {
+        }
+        update_record_t record = {UPDATE_PENDING_MAGIC, update_size, requested_crc, 0};
+        record.record_crc = firmware_crc32((const uint8_t *)&record,
+                                            offsetof(update_record_t, record_crc));
+        if (write_update_page(UPDATE_METADATA_BASE, &record, sizeof record)) {
             NVIC_SystemReset();
         }
     }
@@ -668,14 +680,28 @@ static void handle_ring_frame(bool led_timing_ok)
                        frame[3] < HALL_PORT_COUNT && frame[4] <= 1U) {
                 configure_sensor_monitor(frame[3], frame[4]);
 #if PINBALL_UPDATE_ENABLED
-            } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR) {
-                handle_firmware_command(command, frame + 3, count - 5U);
+            } else if (node_address != RING_UNASSIGNED && origin == RING_COORDINATOR &&
+                       command == RING_FIRMWARE_START && count == 8U && frame[5] == 0U) {
+                start_firmware_update(frame + 3);
 #endif
             }
         } else if (ttl > 1U) {
+#if PINBALL_UPDATE_ENABLED
+            const bool firmware_multicast = destination == RING_MULTICAST &&
+                origin == RING_COORDINATOR && node_address != RING_UNASSIGNED;
+            if (firmware_multicast && command == RING_FIRMWARE_DATA) {
+                /* The returning frame paces the coordinator after every page write. */
+                stage_firmware_page(frame + 3, count - 5U);
+            }
+#endif
             frame[2] = (uint8_t)(((ttl - 1U) << 4) | command);
             ring_write_crc(frame, count);
             send_ring_frame(frame, count);
+#if PINBALL_UPDATE_ENABLED
+            if (firmware_multicast && command == RING_FIRMWARE_APPLY && count == 10U) {
+                apply_firmware_update(frame + 3);
+            }
+#endif
         }
     } else if (origin != node_address) {
         /* A bad CRC can mean the length was corrupted. Resync after an idle gap. */

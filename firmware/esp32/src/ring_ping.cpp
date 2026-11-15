@@ -72,9 +72,14 @@ void log_ring_tx(const uint8_t *frame, size_t size)
 void query_port_type(lv_event_t *);
 
 #if PINBALL_HAS_UPDATE_IMAGE
-enum class UpdateStep { Idle, Start, Data, Apply, BootWait, Address, Verify };
+enum class UpdateStep { Idle, Start, Data, Validate, BootWait, Address, Verify };
+constexpr uint32_t update_timeout_ms = 750;
+constexpr uint32_t update_boot_wait_ms = 2500;
+constexpr uint8_t last_update_node = RING_NODE_1 + RING_NODE_COUNT - 1;
+constexpr uint16_t all_update_nodes = (1U << RING_NODE_COUNT) - 1U;
 UpdateStep update_step = UpdateStep::Idle;
 uint8_t update_node;
+uint16_t update_replies;
 size_t image_offset;
 size_t chunk_size;
 uint32_t image_crc;
@@ -89,7 +94,7 @@ void finish_update(const char *message)
     lv_label_set_text(status_label, message);
 }
 
-void transmit_update(uint8_t destination, uint8_t command, const uint8_t *payload,
+bool transmit_update(uint8_t destination, uint8_t command, const uint8_t *payload,
                      size_t length, uint8_t ttl = RING_TTL)
 {
     outgoing_size = length + 5;
@@ -98,25 +103,41 @@ void transmit_update(uint8_t destination, uint8_t command, const uint8_t *payloa
     outgoing[2] = (ttl << 4) | command;
     memcpy(outgoing + 3, payload, length);
     ring_write_crc(outgoing, outgoing_size);
-    send_ring_frame(outgoing, outgoing_size);
+    if (!send_ring_frame(outgoing, outgoing_size)) {
+        finish_update("Firmware update UART send failed");
+        return false;
+    }
     retries = 0;
-    deadline = millis() + 750;
+    deadline = millis() + update_timeout_ms;
+    return true;
 }
 
 void request_version()
 {
     const uint8_t payload[] = {image_major, image_minor, 0};
-    transmit_update(update_node, RING_FIRMWARE_START, payload, sizeof payload);
+    if (transmit_update(update_node, RING_FIRMWARE_START, payload, sizeof payload) &&
+        update_step == UpdateStep::Start) {
+        lv_label_set_text_fmt(status_label, "Preparing node %u...",
+                              static_cast<unsigned>(update_node));
+    }
+}
+
+bool send_apply(uint8_t mode)
+{
+    uint8_t payload[5];
+    firmware_write_be32(payload, image_crc);
+    payload[4] = mode;
+    return transmit_update(RING_MULTICAST, RING_FIRMWARE_APPLY, payload, sizeof payload);
 }
 
 void send_next_chunk()
 {
     if (image_offset == sizeof py32_update_image) {
-        update_step = UpdateStep::Apply;
-        uint8_t payload[5] = {};
-        firmware_write_be32(payload, image_crc);
-        transmit_update(update_node, RING_FIRMWARE_APPLY, payload, sizeof payload);
-        lv_label_set_text(status_label, "Checking staged image...");
+        update_step = UpdateStep::Validate;
+        update_replies = 0;
+        if (send_apply(RING_FIRMWARE_CHECK_VALID)) {
+            lv_label_set_text(status_label, "Checking staged image on all nodes...");
+        }
         return;
     }
     update_step = UpdateStep::Data;
@@ -126,10 +147,10 @@ void send_next_chunk()
     payload[0] = static_cast<uint8_t>(image_offset >> 8);
     payload[1] = static_cast<uint8_t>(image_offset);
     memcpy(payload + 2, py32_update_image + image_offset, chunk_size);
-    transmit_update(update_node, RING_FIRMWARE_DATA, payload, chunk_size + 2);
-    lv_label_set_text_fmt(status_label, "Updating node %u: %u%%",
-                          static_cast<unsigned>(update_node),
-                          static_cast<unsigned>(image_offset * 100 / sizeof py32_update_image));
+    if (transmit_update(RING_MULTICAST, RING_FIRMWARE_DATA, payload, chunk_size + 2)) {
+        lv_label_set_text_fmt(status_label, "Staging firmware on all nodes: %u%%",
+                              static_cast<unsigned>(image_offset * 100 / sizeof py32_update_image));
+    }
 }
 
 void start_update(lv_event_t *)
@@ -141,54 +162,80 @@ void start_update(lv_event_t *)
         lv_label_set_text(status_label, "Stop monitoring before updating");
         return;
     }
-    update_node = selected_node();
+    update_node = RING_NODE_1;
     image_offset = 0;
     image_crc = firmware_crc32(py32_update_image, sizeof py32_update_image);
     update_step = UpdateStep::Start;
-    lv_label_set_text_fmt(status_label, "Checking node %u...", static_cast<unsigned>(update_node));
     request_version();
+}
+
+void handle_update_echo(const uint8_t *frame, size_t size)
+{
+    // Each node stages the page before forwarding. Match the whole returned DATA frame
+    // apart from its hop count and CRC before allowing the next flash write.
+    if (update_step == UpdateStep::Data && size == outgoing_size &&
+        frame[1] == RING_MULTICAST && frame[2] == ((RING_TTL - RING_NODE_COUNT) << 4 |
+                                                   RING_FIRMWARE_DATA) &&
+        memcmp(frame + 3, outgoing + 3, size - 5) == 0) {
+        image_offset += chunk_size;
+        send_next_chunk();
+    }
+}
+
+bool all_nodes_replied(uint8_t origin)
+{
+    update_replies |= 1U << (origin - RING_NODE_1);
+    return update_replies == all_update_nodes;
 }
 
 void handle_update_reply(uint8_t origin, uint8_t command, const uint8_t *payload, size_t length)
 {
-    if (origin != update_node || update_step == UpdateStep::Idle) {
+    if (origin < RING_NODE_1 || origin > last_update_node) {
         return;
     }
-    if (command == RING_FIRMWARE_START && length == 3) {
+    if (origin == update_node && command == RING_FIRMWARE_START && length == 3) {
         Serial.printf("Node %u firmware %u.%u, update=%u\n", static_cast<unsigned>(origin),
                       static_cast<unsigned>(payload[0]), static_cast<unsigned>(payload[1]),
                       static_cast<unsigned>(payload[2]));
         if (update_step == UpdateStep::Start) {
-            if (payload[2] == 1U) {
+            if (payload[2] != 1U) {
+                finish_update("A node declined the firmware update");
+            } else if (update_node == last_update_node) {
                 send_next_chunk();
             } else {
-                finish_update("Node does not need an update");
+                ++update_node;
+                request_version();
             }
         } else if (update_step == UpdateStep::Verify) {
             const bool verified = payload[0] == image_major && payload[1] == image_minor &&
                                   payload[2] == 0;
-            finish_update(verified ? "Update verified" : "Unexpected version after reboot");
-            if (verified && origin == selected_node()) {
+            if (!verified) {
+                finish_update("Unexpected node version after reboot");
+            } else if (update_node == last_update_node) {
+                finish_update("Firmware update verified on all nodes");
                 query_port_type(nullptr);
+            } else {
+                ++update_node;
+                request_version();
             }
         }
-    } else if (update_step == UpdateStep::Data && command == RING_FIRMWARE_DATA &&
-               length == 2 && ((static_cast<size_t>(payload[0]) << 8) | payload[1]) == image_offset) {
-        image_offset += chunk_size;
-        send_next_chunk();
-    } else if (update_step == UpdateStep::Apply && command == RING_FIRMWARE_APPLY && length == 5) {
-        Serial.printf("Node %u apply CRC %08lX, accepted=%u\n", static_cast<unsigned>(origin),
+    } else if (update_step == UpdateStep::Validate && command == RING_FIRMWARE_APPLY && length == 5) {
+        Serial.printf("Node %u staged CRC %08lX, accepted=%u\n", static_cast<unsigned>(origin),
                       static_cast<unsigned long>(firmware_read_be32(payload)),
                       static_cast<unsigned>(payload[4]));
         if (payload[4] != 1 || firmware_read_be32(payload) != image_crc) {
-            finish_update("Node rejected staged image");
+            finish_update("A node failed staged firmware validation");
             return;
         }
-        update_step = UpdateStep::BootWait;
-        deadline = millis() + 2500;
-        lv_label_set_text(status_label, "Installing image and rebooting...");
-    } else if (update_step == UpdateStep::Address && command == RING_NODE_CONFIG && length == 1) {
+        if (all_nodes_replied(origin) && send_apply(RING_FIRMWARE_COMMIT)) {
+            update_step = UpdateStep::BootWait;
+            deadline = millis() + update_boot_wait_ms;
+            lv_label_set_text(status_label, "Installing firmware and rebooting all nodes...");
+        }
+    } else if (update_step == UpdateStep::Address && command == RING_NODE_CONFIG && length == 1 &&
+               all_nodes_replied(origin)) {
         update_step = UpdateStep::Verify;
+        update_node = RING_NODE_1;
         request_version();
     }
 }
@@ -200,15 +247,23 @@ void poll_update()
     }
     if (update_step == UpdateStep::BootWait) {
         update_step = UpdateStep::Address;
-        transmit_update(RING_UNASSIGNED, RING_SET_ADDRESS, &update_node, 1, RING_ASSIGNMENT_TTL);
-        lv_label_set_text(status_label, "Reassigning updated node...");
-    } else if ((update_step == UpdateStep::Start || update_step == UpdateStep::Data ||
-                update_step == UpdateStep::Verify) && retries < 2) {
+        update_replies = 0;
+        const uint8_t first_address = RING_NODE_1;
+        if (transmit_update(RING_UNASSIGNED, RING_SET_ADDRESS, &first_address, 1,
+                            RING_ASSIGNMENT_TTL)) {
+            lv_label_set_text(status_label, "Reassigning all node addresses...");
+        }
+    } else if ((update_step == UpdateStep::Start || update_step == UpdateStep::Verify) &&
+               retries < 2) {
         ++retries;
-        send_ring_frame(outgoing, outgoing_size);
-        deadline = millis() + 750;
+        if (!send_ring_frame(outgoing, outgoing_size)) {
+            finish_update("Firmware update UART send failed");
+        }
+        deadline = millis() + update_timeout_ms;
+    } else if (update_step == UpdateStep::Address || update_step == UpdateStep::Verify) {
+        finish_update("Timed out confirming installed firmware");
     } else {
-        finish_update("Update timed out. Check the ring.");
+        finish_update("Firmware update timed out before installation");
     }
 }
 #endif
@@ -570,12 +625,18 @@ void led_control_screen_poll()
 #if PINBALL_HAS_UPDATE_IMAGE
         if (!discard_rx && origin != RING_COORDINATOR && dest == RING_COORDINATOR) {
             handle_update_reply(origin, command, config_rx + 3, config_rx_size - 5);
+        } else if (!discard_rx && origin == RING_COORDINATOR &&
+                   crc == ring_crc16(config_rx, config_rx_size - 2)) {
+            handle_update_echo(config_rx, config_rx_size);
         }
 #endif
         config_rx_size = 0;
     }
 #if PINBALL_HAS_UPDATE_IMAGE
     poll_update();
+    if (update_step != UpdateStep::Idle) {
+        return;
+    }
 #endif
     poll_idle();
 }

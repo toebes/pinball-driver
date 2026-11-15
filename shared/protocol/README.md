@@ -266,119 +266,53 @@ the saved position.
 
 ## Firmware update
 
-The ESP32 stores the update image and updates one assigned PY32 at a time.
-Each command is unicast. `CMD_FIRMWARE_START` accepts a version strictly greater than the running major/minor pair. Replies swap source and destination and use the same
-command number. Every frame still carries the ring CRC-16.
+The ESP32 coordinator updates all four assigned PY32 nodes as one group.
+Every frame carries a ring CRC-16. Image offsets and CRC-32 values use
+big-endian byte order. The length field excludes itself.
 
-Firmware Start Request
+| Command | Source → destination | Payload |
+| --- | --- | --- |
+| `CMD_FIRMWARE_START` (10) | 0 → each node individually | Major version, minor version, `00` |
+| START reply | Node → 0 | Running major, running minor, status (`01` accepted, `00` declined) |
+| `CMD_FIRMWARE_DATA` (11) | 0 → 14 | Two-byte image offset, 1–128 image bytes |
+| `CMD_FIRMWARE_APPLY` (12) | 0 → 14 | Four-byte image CRC-32, mode (`02` CHECK_VALID or `00` commit) |
+| CHECK_VALID reply | Node → 0 | Four-byte computed image CRC-32, status (`01` valid, `00` rejected) |
 
-| Byte | Value | Usage |
-| :---: | :---: | --- |
-| 0 | 07 | Packet Length |
-| 1 | 0N | Source Address=0 Destination=N |
-| 2 | FA | TTL=15 Command=10 `CMD_FIRMWARE_START` |
-| 3 | HH | Major version number |
-| 3 | LL | Minor Version Number |
-| 4 | 00 | 0 |
-| 5 | XX | CRC-HI Byte |
-| 6 | XX | CRC-LO Byte |
+1. The coordinator sends START to each address and waits for its reply before
+   moving to the next address. Each node accepts a version strictly greater
+   than its running version. A successful START clears any earlier staging
+   and validation state for that node.
+2. The coordinator sends DATA to multicast address 14. Use contiguous 128-byte
+   pages starting at offset 0, with a shorter final page as needed. Each node
+   stages and verifies the page in flash before forwarding the frame with a
+   decremented TTL and updated ring CRC. The coordinator waits for the matching
+   frame to return after all four hops before sending the next page. A bad
+   offset or failed write causes that node to reject validation.
+3. The coordinator multicasts APPLY with byte 7 (zero-based) set to `02`.
+   Every node forwards it and individually replies with status and the computed
+   CRC-32. CHECK_VALID verifies the staged image and vectors without writing
+   the bootloader's pending record. The coordinator requires status `01` and
+   the expected CRC from each distinct node. A rejection, mismatch, or timeout
+   aborts the update before the coordinator sends the commit.
+4. The coordinator multicasts APPLY with the same CRC and byte 7 set to `00`.
+   Each node forwards the frame. A node with a matching successful validation
+   waits for USART transmission complete before writing its pending record and
+   rebooting. The commit has no reply. The coordinator waits for the nodes to
+   reboot, reassigns addresses with a single SET_ADDRESS starting at node 1,
+   and checks the running version at each address.
 
-Firmware Start Response
+The image CRC is CRC-32/ISO-HDLC over the exact image bytes, excluding any
+flash-page padding. The check value for ASCII `123456789` is `0xCBF43926`.
+The bootloader uses separate 8 KiB application and staging regions. On reset
+it verifies the pending record and staged image, copies the image into the
+application region, verifies the application CRC, and erases the pending
+record. A reset during copying leaves the record available for the next boot.
+A link or flash failure during commit can leave nodes running different
+versions. Post-reboot address and version checks confirm whether every node
+installed the update.
 
-| Byte | Value | Usage |
-| :---: | :---: | --- |
-| 0 | 07 | Packet Length |
-| 1 | N0 | Source Address=N Destination=0 |
-| 2 | FA | TTL=15 Command=10 `CMD_FIRMWARE_START` |
-| 3 | HH | Major version number |
-| 3 | LL | Minor Version Number |
-| 4 | SS | Status: 00=No update, 01=Update needed |
-| 5 | XX | CRC-HI Byte |
-| 6 | XX | CRC-LO Byte |
-
-Firmware Data Request
-
-| Byte | Value | Usage |
-| :---: | :---: | --- |
-| 0 | NN | Packet Length |
-| 1 | 0N | Source Address=0 Destination=N |
-| 2 | FB | TTL=15 Command=11 `CMD_FIRMWARE_DATA` |
-| 3 | HH | High Byte of Offset to data |
-| 4 | LL | Low Byte of Offset to data |
-| 5 | DD | First byte of data |
-| ... | DD | Remaining bytes of data |
-| N+6 | XX | CRC-HI Byte |
-| N+6 | XX | CRC-LO Byte |
-
-Firmware Data Response (note that there is no data in the response payload)
-
-| Byte | Value | Usage |
-| :---: | :---: | --- |
-| 0 | 07 | Packet Length |
-| 1 | N0 | Source Address=N Destination=0 |
-| 2 | FB | TTL=15 Command=11 `CMD_FIRMWARE_DATA` |
-| 3 | HH | High Byte of Offset to data |
-| 4 | LL | Low Byte of Offset to data |
-| 5 | XX | CRC-HI Byte |
-| 6 | XX | CRC-LO Byte |
-
-
-Firmware Apply Request
-
-| Byte | Value | Usage |
-| :---: | :---: | --- |
-| 0 | 0A | Packet Length |
-| 1 | 0N | Source Address=0 Destination=N |
-| 2 | FC | TTL=15 Command=12 `CMD_FIRMWARE_APPLY` |
-| 3 | IC4 | High byte of image CRC-32 |
-| 4 | IC3 | Second High byte of image CRC-32 |
-| 5 | IC2 | Next to low byte of image CRC-32 |
-| 6 | IC1 | Low byte of image CRC-32 |
-| 7 | 00 | 0 |
-| 8 | XX | CRC-HI Byte |
-| 9 | XX | CRC-LO Byte |
-
-Firmware Apply Response
-
-| Byte | Value | Usage |
-| :---: | :---: | --- |
-| 0 | 0A | Packet Length |
-| 1 | N0 | Source Address=N Destination=0 |
-| 2 | FC | TTL=15 Command=12 `CMD_FIRMWARE_APPLY` |
-| 3 | IC4 | High byte of image CRC-32 |
-| 4 | IC3 | Second High byte of image CRC-32 |
-| 5 | IC2 | Next to low byte of image CRC-32 |
-| 6 | IC1 | Low byte of image CRC-32 |
-| 7 | SS | Status 0=rejected, 1=accepted |
-| 8 | XX | CRC-HI Byte |
-| 9 | XX | CRC-LO Byte |
-
-Byte offsets are relative to the start of the application image. Wire
-order for offsets and CRC-32 is most significant byte first. Start at offset
-0 and send contiguous chunks, using 128 bytes except for a possible short
-final chunk. The ESP32 waits for the matching offset ACK before sending the
-next chunk. The receiver validates duplicate retries and re-acknowledges them
-without advancing the accepted image length. The node acknowledges data only after the staging page passes readback. Out-of-order and failed writes receive no ACK. The maximum data frame is 135
-bytes on the wire.
-
-The image check is CRC-32/ISO-HDLC over the exact image bytes, excluding
-any flash-page padding. The check value for ASCII '123456789' is 0xCBF43926.
-Use the end of the last accepted contiguous chunk as the image length.
-A successful `CMD_FIRMWARE_APPLY` reply means the image passed its CRC and is accepted for
-activation. The system waits for UART transmission complete before activating or resetting in order to ensure that the response is sent.
-
-After reboot, the updated PY32 is at address 15. The ESP32 sends `CMD_SET_ADDRESS`
-(command 1) to 15 with the updated node's previous address and waits for that
-node's `CMD_NODE_CONFIG`. This recovery assumes the other nodes keep their assigned
-addresses. If multiple nodes reset, run a fresh enumeration with all PY32s reset.
-
-The bootloader reserves separate 8 KiB application and staging regions.
-`CMD_FIRMWARE_APPLY` checks the staged vectors and CRC, writes a pending record,
-and acknowledges before resetting. At reset the bootloader rechecks staging,
-copies the image into the application region, verifies the application CRC,
-then erases the pending record. A reset during copy leaves the pending record
-available for the next boot to retry. A persistently invalid staged image or
-failed copy requires SWD service. The firmware CRC detects corruption.
+Nodes running V0.8 use the original unicast DATA and APPLY commands.
+Provision them with SWD or the V0.8 coordinator before using multicast.
 
 ## Debug (`CMD_DEBUG`)
 
